@@ -1,0 +1,19 @@
+{
+    "id": "f2fd3b4b-0dfb-4207-a165-67db25b4056f",
+    "version": "0.0.1",
+    "requiredApiVersion": "^1.44.0",
+    "iconFile": "icon.png",
+    "author": {
+        "name": "Krishna Shukla",
+        "homepage": "HomePage",
+        "support": "SupportPage"
+    },
+    "name": "faq-detection",
+    "nameSlug": "faq-detection",
+    "classFile": "FaqDetectionApp.ts",
+    "description": "Helps in newcommers faqs",
+    "implements": [
+        "IPostMessageSent",
+        "IUIKitInteractionHandler"
+    ]
+}
