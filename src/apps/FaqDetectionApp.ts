@@ -3,570 +3,817 @@ import {
     IConfigurationExtend,
     IHttp,
     ILogger,
+    IMessageBuilder,
     IModify,
     IPersistence,
     IRead,
 } from '@rocket.chat/apps-engine/definition/accessors';
 import { App } from '@rocket.chat/apps-engine/definition/App';
-import { IAppInfo, RocketChatAssociationModel, RocketChatAssociationRecord } from '@rocket.chat/apps-engine/definition/metadata';
+import { IAppInfo } from '@rocket.chat/apps-engine/definition/metadata';
 import { IMessage, IPostMessageSent } from '@rocket.chat/apps-engine/definition/messages';
+import { IRoom } from '@rocket.chat/apps-engine/definition/rooms';
 import { 
     IUIKitInteractionHandler, 
-    UIKitActionButtonInteractionContext,
-    IUIKitResponse,
+    IUIKitResponse, 
+    UIKitActionButtonInteractionContext, 
     UIKitViewSubmitInteractionContext,
     UIKitBlockInteractionContext,
     UIKitViewCloseInteractionContext
 } from '@rocket.chat/apps-engine/definition/uikit';
-import { IUser } from '@rocket.chat/apps-engine/definition/users';
-import { RoomType } from '@rocket.chat/apps-engine/definition/rooms';
 
-// App-specific imports
-import { LogLevel } from '../helpers/LogLevel';
-import { getAPIConfig, settings } from '../config/settings';
-import { faqs } from '../data/faqs';
-import { ReviewStatus } from '../data/Review';
-import { LLMService } from '../services/llmService'; 
+import { IUser } from '@rocket.chat/apps-engine/definition/users';
+import { settings, getAPIConfig } from '../config/settings';
+import { FAQ, faqs } from '../data/faqs';
+import { LLMService } from '../services/llmService';
 import { ReviewManager } from '../services/ReviewManager';
 import { NotificationService } from '../services/NotificationService';
+import { createHash } from 'crypto';
+import { 
+    MessageType, 
+    ClassificationResult 
+} from '../services/MessageClassifier';
+import { BM25Service } from '../services/BM25Service';
+import { MessageClassifier } from '../services/MessageClassifier';
+import { ChannelService } from '../services/ChannelService';
+import { 
+    Review, 
+    ReviewStatus 
+} from '../data/Review';
 import { ApproveActionHandler } from '../handlers/ApproveActionHandler';
 import { RejectActionHandler } from '../handlers/RejectActionHandler';
 import { EditActionHandler } from '../handlers/EditActionHandler';
+import { ReviewDistributionService } from '../services/ReviewDistributionService';
 
 export class FaqDetectionApp extends App implements IPostMessageSent, IUIKitInteractionHandler {
     // Track recently processed message IDs and content hashes to avoid duplicates
     private processedMessages: Set<string> = new Set();
     private processedContents: Map<string, number> = new Map();
-    private isProcessingMessage: boolean = false;
+    private processingLock: boolean = false;
     
-    // Map to track reviews and related actions
-    private actionMap: Map<string, { userId: string, timestamp: number, status: string }> = new Map();
-    
-    // Configuration
-    private apiConfig: any = null;
-    private reviewMode: boolean = true;
-    private roomFaqs: any[] = [];
-    private appLogger: ILogger;
+    // Map to store review IDs by action IDs
+    private reviewActions: Map<string, string> = new Map();
     
     constructor(info: IAppInfo, logger: ILogger, accessors: IAppAccessors) {
         super(info, logger, accessors);
-        this.appLogger = logger;
         logger.debug('FAQ Detection App initialized');
     }
 
     /**
-     * Process a button click action
+     * Get the modify accessor from the current context
+     * This method is deprecated and should not be used.
+     * Instead, use the modify parameter passed to the handler methods.
+     * @deprecated Use the modify parameter passed to the handler methods
+     * @returns The modify accessor from the current context
      */
-    public async executeActionButtonInteraction(
+    public getModify(): IModify {
+        // This is a workaround to avoid type errors
+        // In practice, this method should not be called
+        throw new Error('getModify is deprecated. Use the modify parameter passed to the handler methods.');
+    }
+
+    public async extendConfiguration(
+        configuration: IConfigurationExtend
+    ): Promise<void> {
+        await Promise.all([
+            ...settings.map((setting) =>
+                configuration.settings.provideSetting(setting)
+            ),
+        ]);
+    }
+
+    /**
+     * Check if a message should be processed for FAQ detection
+     * This method implements the IPostMessageSent interface
+     */
+    async checkPostMessageSent(message: IMessage, read: IRead, http: IHttp): Promise<boolean> {
+        // This is the interface method that must match IPostMessageSent
+        return true; // Always return true to ensure executePostMessageSent is called
+    }
+
+    /**
+     * Internal method to check if a message should be processed
+     * This is the actual implementation with all required parameters
+     */
+    private async shouldProcessMessage(message: IMessage, read: IRead, http: IHttp, persistence: IPersistence, modify: IModify): Promise<boolean> {
+        this.getLogger().debug('Message received, starting message processing check');
+        
+        // Skip messages from bots or the app itself
+        if (message.sender && (message.sender.type === 'bot' || message.sender.id === 'app')) {
+            this.getLogger().debug('Skipping bot or app message');
+            
+            // Log bot message drop to the channel if enabled
+            const config = await getAPIConfig(read);
+            if (config.faqLogChannel) {
+                try {
+                    const channelService = new ChannelService(read, modify, this.getLogger());
+                    
+                    const appUser = await read.getUserReader().getAppUser();
+                    if (!appUser) {
+                        this.getLogger().error('Could not get app user for logging');
+                        return false;
+                    }
+                    
+                    const logChannel = await channelService.getOrCreateLogChannel(appUser, config.faqLogChannel);
+                    
+                    if (logChannel) {
+                        const messageBuilder = modify.getCreator().startMessage()
+                            .setRoom(logChannel)
+                            .setText(`🤖 Skipped bot message from ${message.sender.username}: "${message.text}"`);
+                        
+                        await modify.getCreator().finish(messageBuilder);
+                        this.getLogger().debug('Bot message drop logged to channel');
+                    }
+                } catch (error) {
+                    this.getLogger().error('Error logging bot message drop:', error);
+                }
+            }
+            
+            return false;
+        }
+
+        // Check if the message was sent by this app
+        const appUser = await read.getUserReader().getAppUser();
+        if (appUser && message.sender && message.sender.id === appUser.id) {
+            this.getLogger().debug('Skipping message from this app');
+            return false;
+        }
+
+        // Get message text
+        const text = message.text || '';
+        if (text.length === 0) {
+            this.getLogger().debug('Skipping empty message');
+            return false;
+        }
+
+        // Skip messages that start with our bot prefix
+        if (text.startsWith('🤖 FAQ Bot:')) {
+            this.getLogger().debug('Skipping message with bot prefix');
+            return false;
+        }
+
+        // *** DUPLICATE DETECTION COMPLETELY DISABLED ***
+        // We still record the messages for reference but will process all messages regardless
+        const messageId = message.id || '';
+        const contentHash = this.hashString(text);
+        const uniqueId = `${messageId}:${contentHash}`;
+        
+        // Record the message but do not check if it's a duplicate
+        this.processedMessages.add(uniqueId);
+        this.processedContents.set(contentHash, Date.now());
+        
+        this.getLogger().debug(`Message passed all checks, will be processed: ${uniqueId} (DUPLICATE DETECTION DISABLED)`);
+        return true;
+    }
+
+    async executePostMessageSent(message: IMessage, read: IRead, http: IHttp, persistence: IPersistence, modify: IModify): Promise<void> {
+        try {
+            // Set processing lock
+            this.processingLock = true;
+            
+            // Check if the message should be processed
+            if (!(await this.shouldProcessMessage(message, read, http, persistence, modify))) {
+                this.processingLock = false;
+                return;
+            }
+            
+            // Get message text
+            const text = message.text || '';
+            const messageId = message.id || '';
+            const contentHash = this.hashString(text);
+            const uniqueId = `${messageId}:${contentHash}`;
+            
+            // Record message but don't check for duplicates (duplicate detection disabled)
+            this.processedMessages.add(uniqueId);
+            this.processedContents.set(contentHash, Date.now());
+            
+            // Keep the sets size manageable
+            if (this.processedMessages.size > 100) {
+                const iterator = this.processedMessages.values();
+                this.processedMessages.delete(iterator.next().value);
+            }
+            
+            this.getLogger().debug(`Processing message: ${uniqueId} (DUPLICATE DETECTION DISABLED)`);
+            
+            // Get API configuration
+            const config = await getAPIConfig(read);
+            this.getLogger().debug('API config retrieved:', config);
+            
+            // Check if API configuration is valid
+            if (!config.apiKey || !config.apiEndpoint) {
+                this.getLogger().error('API configuration is missing. Please configure API Key and API Endpoint in app settings.');
+                this.processingLock = false;
+                return;
+            }
+            
+            // Initialize services
+            const messageClassifier = new MessageClassifier(
+                faqs,
+                config.similarityThreshold || 0.7,
+                this.getLogger()
+            );
+            
+            const channelService = new ChannelService(
+                read,
+                modify,
+                this.getLogger()
+            );
+            
+            const reviewDistributionService = new ReviewDistributionService(
+                read,
+                persistence,
+                read.getPersistenceReader(),
+                this.getLogger()
+            );
+            
+            const llmService = new LLMService(
+                http, 
+                config.apiKey, 
+                config.apiEndpoint, 
+                config.modelType
+            );
+            
+            // Classify the message
+            const classification = messageClassifier.classifyMessage(text);
+            this.getLogger().debug(`Message classified as: ${classification.type} with score: ${classification.score}`);
+            
+            // Process based on classification
+            switch (classification.type) {
+                case MessageType.ALPHA:
+                    // Direct match - respond immediately
+                    await this.handleAlphaMessage(
+                        message,
+                        classification,
+                        modify,
+                        read,
+                        config,
+                        channelService
+                    );
+                    break;
+                    
+                case MessageType.BETA:
+                    // Potential match - needs LLM processing
+                    await this.handleBetaMessage(
+                        message,
+                        classification,
+                        llmService,
+                        read,
+                        persistence,
+                        modify,
+                        config,
+                        channelService,
+                        reviewDistributionService
+                    );
+                    break;
+                    
+                case MessageType.UNRELATED:
+                    // Not a question or unrelated - do nothing
+                    this.getLogger().debug('Message classified as unrelated, no action taken');
+                    break;
+            }
+            
+        } catch (error) {
+            this.getLogger().error('Error processing message:', error);
+        } finally {
+            // Release processing lock
+            this.processingLock = false;
+        }
+    }
+
+    /**
+     * Handles Alpha messages (direct matches)
+     */
+    private async handleAlphaMessage(
+        message: IMessage,
+        classification: {
+            type: MessageType,
+            matchedFaq?: any,
+            score: number,
+            message: string
+        },
+        modify: IModify,
+        read: IRead,
+        config: any,
+        channelService: ChannelService
+    ): Promise<void> {
+        this.getLogger().debug('Handling Alpha message (direct match)');
+        
+        if (!classification.matchedFaq) {
+            this.getLogger().error('Alpha message has no matched FAQ');
+            return;
+        }
+        
+        // Get the answer from the matched FAQ
+        const answer = classification.matchedFaq.answer;
+        
+        // Send the response
+        await this.sendResponse(answer, message.room, modify);
+        this.getLogger().debug('Alpha response sent successfully');
+        
+        // Log to FAQ channel if enabled
+        if (config.faqLogChannel) {
+            try {
+                // Get or create the log channel
+                const appUser = await read.getUserReader().getAppUser();
+                if (!appUser) {
+                    this.getLogger().error('Could not get app user for logging');
+                    return;
+                }
+                
+                const logChannel = await channelService.getOrCreateLogChannel(
+                    appUser,
+                    config.faqLogChannel
+                );
+                
+                // Log the message
+                await channelService.logMessage(
+                    logChannel,
+                    MessageType.ALPHA,
+                    classification.message,
+                    message.sender,
+                    message.room,
+                    {
+                        score: classification.score,
+                        matchedQuestion: classification.matchedFaq.question,
+                        proposedAnswer: answer
+                    }
+                );
+                
+                this.getLogger().debug('Alpha message logged to channel');
+            } catch (error) {
+                this.getLogger().error('Error logging Alpha message to channel:', error);
+            }
+        }
+    }
+
+    /**
+     * Handles Beta messages (potential matches requiring LLM and review)
+     */
+    private async handleBetaMessage(
+        message: IMessage,
+        classification: {
+            type: MessageType,
+            score: number,
+            message: string
+        },
+        llmService: LLMService,
+        read: IRead,
+        persistence: IPersistence,
+        modify: IModify,
+        config: any,
+        channelService: ChannelService,
+        reviewDistributionService: ReviewDistributionService
+    ): Promise<void> {
+        this.getLogger().debug('Handling Beta message (needs LLM processing)');
+        
+        // Process with LLM
+        const llmResult = await llmService.checkMessage(classification.message, faqs);
+        this.getLogger().debug('LLM service result:', llmResult);
+        
+        // If LLM found a match, process it
+        if (llmResult.matched && llmResult.answer) {
+            this.getLogger().debug('LLM found a match, processing for review');
+            
+            // Check if review mode is enabled
+            if (config.enableReviewMode && config.reviewerUsernames) {
+                // Select a reviewer using round-robin
+                let reviewer: IUser | undefined;
+                
+                // Always use round-robin for reviewer selection when multiple reviewers exist
+                if (config.reviewerUsernames.length > 1) {
+                    this.getLogger().debug('Using round-robin reviewer selection for multiple reviewers');
+                    reviewer = await reviewDistributionService.selectNextReviewer(config.reviewerUsernames);
+                } else {
+                    // Use the only reviewer in the list
+                    const username = config.reviewerUsernames[0];
+                    this.getLogger().debug(`Using single reviewer: ${username}`);
+                    reviewer = await read.getUserReader().getByUsername(username);
+                }
+                
+                if (!reviewer) {
+                    this.getLogger().error('No reviewer available');
+                    return;
+                }
+                
+                // Create review
+                const reviewManager = new ReviewManager(persistence, read.getPersistenceReader());
+                const notificationService = new NotificationService(read, modify);
+                
+                const review = await reviewManager.createReview(
+                    message,
+                    message.room,
+                    message.sender,
+                    llmResult.detectedQuestion || '',
+                    llmResult.answer
+                );
+                
+                // Store the review ID for action handling
+                const approveActionId = `approve_${review.reviewId}`;
+                const rejectActionId = `reject_${review.reviewId}`;
+                const editActionId = `edit_${review.reviewId}`;
+                
+                this.reviewActions.set(approveActionId, review.reviewId);
+                this.reviewActions.set(rejectActionId, review.reviewId);
+                this.reviewActions.set(editActionId, review.reviewId);
+                
+                // Send notification to reviewer
+                await notificationService.sendReviewNotification(review, reviewer);
+                this.getLogger().debug(`Review notification sent to ${reviewer.username}`);
+                
+                // Log to FAQ channel if enabled
+                if (config.faqLogChannel) {
+                    try {
+                        // Get or create the log channel
+                        const appUser = await read.getUserReader().getAppUser();
+                        if (!appUser) {
+                            this.getLogger().error('Could not get app user for logging');
+                            return;
+                        }
+                        
+                        const logChannel = await channelService.getOrCreateLogChannel(
+                            appUser,
+                            config.faqLogChannel
+                        );
+                        
+                        // Log the message
+                        await channelService.logMessage(
+                            logChannel,
+                            MessageType.BETA,
+                            classification.message,
+                            message.sender,
+                            message.room,
+                            {
+                                score: classification.score,
+                                matchedQuestion: llmResult.detectedQuestion,
+                                proposedAnswer: llmResult.answer,
+                                reviewId: review.reviewId
+                            },
+                            reviewer // Pass the reviewer to the logMessage method
+                        );
+                        
+                        this.getLogger().debug('Beta message logged to channel');
+                    } catch (error) {
+                        this.getLogger().error('Error logging Beta message to channel:', error);
+                    }
+                }
+            } else {
+                // Direct response mode (original behavior)
+                this.getLogger().debug('Review mode disabled, sending direct response...');
+                await this.sendResponse(llmResult.answer, message.room, modify);
+                this.getLogger().debug('Response sent successfully');
+            }
+        } else {
+            this.getLogger().debug('LLM found no match or no answer available');
+            if (llmResult.error) {
+                this.getLogger().error('Error from LLM service:', llmResult.error);
+            }
+        }
+    }
+
+    /**
+     * Handles the review workflow when review mode is enabled
+     */
+    async handleReviewMode(
+        message: IMessage, 
+        detectedQuestion: string,
+        proposedAnswer: string,
+        reviewerUsernames: string[],
+        read: IRead,
+        persistence: IPersistence,
+        modify: IModify
+    ): Promise<void> {
+        this.getLogger().debug('Handling review mode workflow');
+        
+        // Create review manager and notification service
+        const reviewManager = new ReviewManager(persistence, read.getPersistenceReader());
+        const notificationService = new NotificationService(read, modify);
+        
+        // Create a review record
+        const review = await reviewManager.createReview(
+            message,
+            message.room,
+            message.sender,
+            detectedQuestion,
+            proposedAnswer
+        );
+        
+        this.getLogger().debug(`Review created with ID: ${review.reviewId}`);
+        
+        // Store the review ID for action handling
+        const approveActionId = `approve_${review.reviewId}`;
+        const rejectActionId = `reject_${review.reviewId}`;
+        const editActionId = `edit_${review.reviewId}`;
+        
+        this.reviewActions.set(approveActionId, review.reviewId);
+        this.reviewActions.set(rejectActionId, review.reviewId);
+        this.reviewActions.set(editActionId, review.reviewId);
+        
+        // Send notification to the first reviewer
+        // In the future, we could implement round-robin or load balancing
+        const reviewerUsername = reviewerUsernames[0];
+        const reviewer = await read.getUserReader().getByUsername(reviewerUsername);
+        
+        if (!reviewer) {
+            this.getLogger().error(`Reviewer not found: ${reviewerUsername}`);
+            return;
+        }
+        
+        await notificationService.sendReviewNotification(review, reviewer);
+        this.getLogger().debug(`Review notification sent to ${reviewerUsername}`);
+    }
+
+    /**
+     * Handles UI action button interactions (approve/reject)
+     */
+    async executeActionButtonInteraction(
         context: UIKitActionButtonInteractionContext,
         read: IRead,
         http: IHttp,
         persistence: IPersistence,
         modify: IModify
     ): Promise<IUIKitResponse> {
-        this.log(LogLevel.DEBUG, 'ActionButton interaction received');
+        const { actionId, triggerId, user } = context.getInteractionData();
+        this.getLogger().debug(`Action button clicked: ${actionId} by user: ${user.id}`);
         
-        try {
-            const { actionId, triggerId, user } = context.getInteractionData();
-            
-            // Parse the action ID to get the action type and review ID
-            const actionParts = actionId.split('_');
-            if (actionParts.length < 2) {
-                this.log(LogLevel.ERROR, `Invalid action ID format: ${actionId}`);
-                return context.getInteractionResponder().errorResponse();
+        // Get the review ID from the action ID mapping
+        let reviewId: string | undefined;
+        
+        if (actionId.startsWith('approve_') || actionId.startsWith('reject_') || 
+            actionId.startsWith('edit_') || actionId.startsWith('submit_edit_') || 
+            actionId.startsWith('cancel_edit_') || actionId.startsWith('confirm_edit_')) {
+            // Extract reviewId from the actionId
+            const parts = actionId.split('_');
+            if (parts.length > 1) {
+                reviewId = parts[parts.length - 1];
+                // Also store it in the map for future reference
+                this.reviewActions.set(actionId, reviewId);
             }
-            
-            const action = actionParts[0];
-            const reviewId = actionParts[actionParts.length - 1];
-            
-            this.log(LogLevel.DEBUG, `Processing action: ${action} for review: ${reviewId}`);
-            
-            // Handle different action types
-            if (action === 'approve') {
-                // Create and execute the approve action handler
-                const approveHandler = new ApproveActionHandler(read, persistence, modify, this.appLogger);
-                await approveHandler.handleApproveAction(reviewId, user);
-                
-                this.log(LogLevel.INFO, `Review ${reviewId} approved by ${user.username}`);
-                
-                // Clean up the action map
-                this.deleteAction(reviewId);
-                
-            } else if (action === 'reject') {
-                // Create and execute the reject action handler
-                const rejectHandler = new RejectActionHandler(read, persistence, modify, this.appLogger);
-                await rejectHandler.handleRejectAction(reviewId, user);
-                
-                this.log(LogLevel.INFO, `Review ${reviewId} rejected by ${user.username}`);
-                
-                // Clean up the action map
-                this.deleteAction(reviewId);
-                
-            } else if (action === 'edit') {
-                // Create and execute the edit action handler
-                const editHandler = new EditActionHandler(read, persistence, modify, this.appLogger);
-                await editHandler.handleEditAction(reviewId, user);
-                
-                this.log(LogLevel.INFO, `Edit interface displayed for review ${reviewId} by ${user.username}`);
-                
-                // Store user in action map for handling their response
-                this.updateActionMap(reviewId, user.id, 'waiting_for_edit');
-                
-            } else if (action === 'submit' && actionParts[1] === 'edit') {
-                // Handle the submit_edit action
-                const editHandler = new EditActionHandler(read, persistence, modify, this.appLogger);
-                await editHandler.handleSubmitEdit(reviewId, user);
-                
-                this.log(LogLevel.INFO, `Edit submission initiated for review ${reviewId} by ${user.username}`);
-                
-                // Update the action map to indicate we're waiting for a text response
-                this.updateActionMap(reviewId, user.id, 'waiting_for_edit_text');
-                
-            } else if (action === 'cancel' && actionParts[1] === 'edit') {
-                // Handle the cancel_edit action
-                const editHandler = new EditActionHandler(read, persistence, modify, this.appLogger);
-                await editHandler.handleCancelEdit(reviewId, user);
-                
-                this.log(LogLevel.INFO, `Edit canceled for review ${reviewId} by ${user.username}`);
-                
-                // Clean up the action map
-                this.deleteAction(reviewId);
-                
-            } else {
-                this.log(LogLevel.ERROR, `Unknown action type: ${action}`);
-                return context.getInteractionResponder().errorResponse();
-            }
-            
+        } else {
+            reviewId = this.reviewActions.get(actionId);
+        }
+        
+        if (!reviewId) {
+            this.getLogger().error(`No review ID found for action: ${actionId}`);
             return context.getInteractionResponder().successResponse();
-        } catch (error) {
-            this.log(LogLevel.ERROR, `Error processing action button: ${error instanceof Error ? error.message : String(error)}`);
-            return context.getInteractionResponder().errorResponse();
-        }
-    }
-
-    /**
-     * Process incoming messages to check for responses to edit prompts
-     */
-    public async executePostMessageSent(
-        message: IMessage,
-        read: IRead,
-        http: IHttp,
-        persistence: IPersistence,
-        modify: IModify
-    ): Promise<void> {
-        // Set processing lock to prevent concurrent processing
-        if (this.isProcessingMessage) {
-            this.log(LogLevel.DEBUG, 'Already processing a message, skipping this one');
-            return;
         }
         
-        this.isProcessingMessage = true;
+        // Get the review manager
+        const reviewManager = new ReviewManager(persistence, read.getPersistenceReader());
         
-        try {
-            // Skip messages from the app itself
-            const appUser = await read.getUserReader().getAppUser();
-            if (message.sender?.id === appUser?.id) {
-                this.log(LogLevel.DEBUG, 'Skipping message from the app itself');
-                this.isProcessingMessage = false;
-                return;
-            }
+        // Get the review
+        const review = await reviewManager.getReviewById(reviewId);
+        if (!review) {
+            this.getLogger().error(`Review not found: ${reviewId}`);
+            return context.getInteractionResponder().successResponse();
+        }
+        
+        // Get the notification service
+        const notificationService = new NotificationService(read, modify);
+        
+        // Handle different actions
+        if (actionId.startsWith('approve_')) {
+            // Handle approve action
+            const handler = new ApproveActionHandler(read, persistence, modify, this.getLogger());
+            await handler.handleApproveAction(reviewId, user);
             
-            // Check if this is a response to an edit prompt in a DM
-            const isDmResponse = await this.checkForEditResponse(message, read, persistence, modify);
-            if (isDmResponse) {
-                this.log(LogLevel.DEBUG, 'Processed message as an edit response');
-                this.isProcessingMessage = false;
-                return;
-            }
-            
-            // Get the text from the message
-            const text = message.text || '';
-            if (!text.trim()) {
-                this.log(LogLevel.DEBUG, 'Message has no text, skipping');
-                this.isProcessingMessage = false;
-                return;
-            }
-            
-            // Create a unique identifier for this message
-            const messageId = message.id;
-            const contentHash = this.createContentHash(text);
-            const uniqueId = `${messageId}-${contentHash}`;
-            
-            // Record this message but don't check for duplicates (duplicate detection disabled)
-            this.log(LogLevel.DEBUG, `Processing message with ID: ${uniqueId} (duplicate detection disabled)`);
-            this.processedContents.set(contentHash, Date.now());
-            
-            // Limit the size of the processedContents map
-            if (this.processedContents.size > 100) {
-                // Remove the oldest entries to keep the map size manageable
-                const entries = Array.from(this.processedContents.entries());
-                entries.sort((a, b) => a[1] - b[1]); // Sort by timestamp
-                
-                const entriesToDelete = entries.slice(0, entries.length - 100);
-                entriesToDelete.forEach(([key]) => this.processedContents.delete(key));
-            }
-            
-            // Check if API configuration is valid
-            const hasValidConfig = this.checkValidApiConfig();
-            if (!hasValidConfig) {
-                this.log(LogLevel.ERROR, 'Invalid API configuration');
-                this.isProcessingMessage = false;
-                return;
-            }
-            
-            // Process the message to check against FAQs
-            const llmService = new LLMService(http, this.apiConfig.apiKey, this.apiConfig.endpoint, this.apiConfig.modelType);
-            const matchResult = await llmService.checkMessage(text, this.roomFaqs);
-            
-            if (matchResult.matched) {
-                this.log(LogLevel.INFO, `Matched FAQ: ${matchResult.detectedQuestion || 'Unknown'}`);
-                
-                // Get room information
-                const room = message.room;
-                if (!room) {
-                    this.log(LogLevel.ERROR, 'Room not found in message');
-                    this.isProcessingMessage = false;
-                    return;
-                }
-                
-                // Check if review mode is enabled
-                if (this.reviewMode) {
-                    // Process in review mode, creating a review and notifying reviewers
-                    await this.processInReviewMode(matchResult, message, read, persistence, modify);
-                } else {
-                    // Send response directly to the channel
-                    const answer = matchResult.answer || 'No answer available';
-                    await this.sendResponse(answer, room.id, modify, read);
-                }
-            } else {
-                this.log(LogLevel.DEBUG, 'No FAQ match found for message');
-            }
-        } catch (error) {
-            this.log(LogLevel.ERROR, `Error processing message: ${error instanceof Error ? error.message : String(error)}`);
-            
-            // Attempt to send an error message to the user
-            try {
-                if (message.room) {
-                    const text = 'Sorry, there was an error processing your message.';
-                    const messageBuilder = modify.getCreator().startMessage()
-                        .setRoom(message.room)
-                        .setText(text);
+            // Update log channel if enabled
+            const config = await getAPIConfig(read);
+            if (config.faqLogChannel) {
+                try {
+                    const channelService = new ChannelService(read, modify, this.getLogger());
+                    const appUser = await read.getUserReader().getAppUser();
+                    if (!appUser) {
+                        this.getLogger().error('Could not get app user for logging');
+                        return context.getInteractionResponder().successResponse();
+                    }
                     
-                    await modify.getCreator().finish(messageBuilder);
+                    const logChannel = await channelService.getOrCreateLogChannel(
+                        appUser,
+                        config.faqLogChannel
+                    );
+                    
+                    await channelService.updateLogMessageStatus(
+                        logChannel,
+                        reviewId,
+                        'approved',
+                        user
+                    );
+                } catch (error) {
+                    this.getLogger().error('Error updating log channel:', error);
                 }
-            } catch (sendError) {
-                this.log(LogLevel.ERROR, `Error sending error message: ${sendError instanceof Error ? sendError.message : String(sendError)}`);
             }
-        } finally {
-            this.isProcessingMessage = false;
+        } else if (actionId.startsWith('reject_')) {
+            // Handle reject action
+            const handler = new RejectActionHandler(read, persistence, modify, this.getLogger());
+            await handler.handleRejectAction(reviewId, user);
+            
+            // Update log channel if enabled
+            const config = await getAPIConfig(read);
+            if (config.faqLogChannel) {
+                try {
+                    const channelService = new ChannelService(read, modify, this.getLogger());
+                    const appUser = await read.getUserReader().getAppUser();
+                    if (!appUser) {
+                        this.getLogger().error('Could not get app user for logging');
+                        return context.getInteractionResponder().successResponse();
+                    }
+                    
+                    const logChannel = await channelService.getOrCreateLogChannel(
+                        appUser,
+                        config.faqLogChannel
+                    );
+                    
+                    await channelService.updateLogMessageStatus(
+                        logChannel,
+                        reviewId,
+                        'rejected',
+                        user
+                    );
+                } catch (error) {
+                    this.getLogger().error('Error updating log channel:', error);
+                }
+            }
+        } else if (actionId.startsWith('edit_')) {
+            // Handle edit action
+            const handler = new EditActionHandler(read, persistence, modify, this.getLogger());
+            await handler.handleEditAction(reviewId, user, triggerId);
+            
+            // Update log channel if enabled
+            const config = await getAPIConfig(read);
+            if (config.faqLogChannel) {
+                try {
+                    const channelService = new ChannelService(read, modify, this.getLogger());
+                    const appUser = await read.getUserReader().getAppUser();
+                    if (!appUser) {
+                        this.getLogger().error('Could not get app user for logging');
+                        return context.getInteractionResponder().successResponse();
+                    }
+                    
+                    const logChannel = await channelService.getOrCreateLogChannel(
+                        appUser,
+                        config.faqLogChannel
+                    );
+                    
+                    await channelService.updateLogMessageStatus(
+                        logChannel,
+                        reviewId,
+                        'editing',
+                        user
+                    );
+                } catch (error) {
+                    this.getLogger().error('Error updating log channel:', error);
+                }
+            }
+        } else if (actionId.startsWith('submit_edit_')) {
+            // Handle submit edit action
+            const handler = new EditActionHandler(read, persistence, modify, this.getLogger());
+            await handler.handleSubmitEdit(reviewId, user);
+            
+            // Update log channel if enabled
+            const config = await getAPIConfig(read);
+            if (config.faqLogChannel) {
+                try {
+                    const channelService = new ChannelService(read, modify, this.getLogger());
+                    const appUser = await read.getUserReader().getAppUser();
+                    if (!appUser) {
+                        this.getLogger().error('Could not get app user for logging');
+                        return context.getInteractionResponder().successResponse();
+                    }
+                    
+                    const logChannel = await channelService.getOrCreateLogChannel(
+                        appUser,
+                        config.faqLogChannel
+                    );
+                    
+                    await channelService.updateLogMessageStatus(
+                        logChannel,
+                        reviewId,
+                        'edited',
+                        user
+                    );
+                } catch (error) {
+                    this.getLogger().error('Error updating log channel:', error);
+                }
+            }
+        } else if (actionId.startsWith('cancel_edit_')) {
+            // Handle cancel edit action
+            const handler = new EditActionHandler(read, persistence, modify, this.getLogger());
+            await handler.handleCancelEdit(reviewId, user);
+            
+            // Update log channel if enabled
+            const config = await getAPIConfig(read);
+            if (config.faqLogChannel) {
+                try {
+                    const channelService = new ChannelService(read, modify, this.getLogger());
+                    const appUser = await read.getUserReader().getAppUser();
+                    if (!appUser) {
+                        this.getLogger().error('Could not get app user for logging');
+                        return context.getInteractionResponder().successResponse();
+                    }
+                    
+                    const logChannel = await channelService.getOrCreateLogChannel(
+                        appUser,
+                        config.faqLogChannel
+                    );
+                    
+                    await channelService.updateLogMessageStatus(
+                        logChannel,
+                        reviewId,
+                        'pending',
+                        user
+                    );
+                } catch (error) {
+                    this.getLogger().error('Error updating log channel:', error);
+                }
+            }
         }
+        
+        return context.getInteractionResponder().successResponse();
     }
 
     /**
-     * Required by IUIKitInteractionHandler
+     * Handles modal submit interactions
      */
-    public async executeViewSubmitHandler(
+    async executeViewSubmitHandler(
         context: UIKitViewSubmitInteractionContext,
         read: IRead,
         http: IHttp,
         persistence: IPersistence,
         modify: IModify
     ): Promise<IUIKitResponse> {
-        // Not implemented for this app
+        const { view, user } = context.getInteractionData();
+        this.getLogger().debug(`Modal submitted: ${view.id} by user: ${user.id}`);
+        
+        // Check if this is an edit modal
+        if (view.id.startsWith('edit_modal_')) {
+            // Extract review ID from the modal ID
+            const reviewId = view.id.replace('edit_modal_', '');
+            
+            // Get the edited answer from the input
+            // Use type assertion to access the state values
+            const state = view.state as any;
+            const editedAnswer = state && state.edit_answer_block ? 
+                state.edit_answer_block.edit_answer_input : undefined;
+            
+            if (!editedAnswer) {
+                this.getLogger().error(`No edited answer found in modal submission`);
+                return context.getInteractionResponder().successResponse();
+            }
+            
+            // Process the edited answer
+            try {
+                const handler = new EditActionHandler(read, persistence, modify, this.getLogger());
+                await handler.handleSubmitEdit(reviewId, user, editedAnswer);
+                
+                return context.getInteractionResponder().successResponse();
+            } catch (error) {
+                this.getLogger().error(`Error processing edited answer: ${error}`);
+                return context.getInteractionResponder().errorResponse();
+            }
+        }
+        
         return context.getInteractionResponder().successResponse();
     }
 
-    /**
-     * Required by IUIKitInteractionHandler
-     */
-    public async executeBlockActionHandler(
+    // Required by IUIKitInteractionHandler but not used in this app
+    async executeBlockActionHandler(
         context: UIKitBlockInteractionContext,
         read: IRead,
         http: IHttp,
         persistence: IPersistence,
         modify: IModify
     ): Promise<IUIKitResponse> {
-        // Not implemented for this app - handled through action button interactions
         return context.getInteractionResponder().successResponse();
     }
 
-    /**
-     * Required by IUIKitInteractionHandler
-     */
-    public async executeViewClosedHandler(
+    // Required by IUIKitInteractionHandler but not used in this app
+    async executeViewClosedHandler(
         context: UIKitViewCloseInteractionContext,
         read: IRead,
         http: IHttp,
         persistence: IPersistence,
         modify: IModify
     ): Promise<IUIKitResponse> {
-        // Not implemented for this app
         return context.getInteractionResponder().successResponse();
     }
 
-    /**
-     * Checks if a message is a response to an edit prompt and processes it
-     */
-    private async checkForEditResponse(
-        message: IMessage,
-        read: IRead,
-        persistence: IPersistence,
-        modify: IModify
-    ): Promise<boolean> {
-        try {
-            // Get the sender user ID
-            const senderId = message.sender?.id;
-            if (!senderId) {
-                return false;
-            }
-            
-            // Check if this is a direct message
-            const room = message.room;
-            if (!room || room.type !== RoomType.DIRECT_MESSAGE) {
-                return false;
-            }
-            
-            // Check if we have any pending edit actions for this user
-            const pendingEditAction = this.findPendingEditAction(senderId);
-            if (!pendingEditAction || pendingEditAction.status !== 'waiting_for_edit_text') {
-                return false;
-            }
-            
-            this.log(LogLevel.DEBUG, `Found pending edit for review ${pendingEditAction.reviewId} from user ${senderId}`);
-            
-            // Process the edited text
-            const editHandler = new EditActionHandler(read, persistence, modify, this.appLogger);
-            const user = await read.getUserReader().getById(senderId);
-            
-            if (!user) {
-                this.log(LogLevel.ERROR, `User not found: ${senderId}`);
-                return false;
-            }
-            
-            // Process the edited response
-            await editHandler.processEditedResponse(pendingEditAction.reviewId, user, message.text || '');
-            
-            // Clean up the action map
-            this.deleteAction(pendingEditAction.reviewId);
-            
-            return true;
-        } catch (error) {
-            this.log(LogLevel.ERROR, `Error checking for edit response: ${error instanceof Error ? error.message : String(error)}`);
-            return false;
-        }
-    }
-
-    /**
-     * Find a pending edit action for a user
-     */
-    private findPendingEditAction(userId: string): { reviewId: string, status: string } | null {
-        for (const [reviewId, actionData] of this.actionMap.entries()) {
-            if (actionData.userId === userId && 
-                (actionData.status === 'waiting_for_edit' || actionData.status === 'waiting_for_edit_text')) {
-                return { reviewId, status: actionData.status };
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Updates the action map with user information and status
-     */
-    private updateActionMap(reviewId: string, userId: string, status: string): void {
-        this.actionMap.set(reviewId, { userId, timestamp: Date.now(), status });
-        this.log(LogLevel.DEBUG, `Updated action map for review ${reviewId} with status: ${status}`);
-    }
-
-    /**
-     * Deletes an action from the action map
-     */
-    private deleteAction(reviewId: string): void {
-        this.actionMap.delete(reviewId);
-        this.log(LogLevel.DEBUG, `Deleted action for review: ${reviewId}`);
-    }
-
-    /**
-     * Creates a hash of the content for tracking duplicates
-     */
-    private createContentHash(content: string): string {
+    // Simple string hashing function
+    hashString(str: string): string {
         let hash = 0;
-        for (let i = 0; i < content.length; i++) {
-            const char = content.charCodeAt(i);
-            hash = ((hash << 5) - hash) + char;
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = (hash << 5) - hash + char;
             hash = hash & hash; // Convert to 32bit integer
         }
         return hash.toString();
     }
 
-    /**
-     * Check if the API configuration is valid
-     */
-    private checkValidApiConfig(): boolean {
-        return !!this.apiConfig && 
-               typeof this.apiConfig === 'object' && 
-               !!this.apiConfig.apiKey && 
-               !!this.apiConfig.endpoint;
-    }
+    async sendResponse(answer: string, room: any, modify: IModify): Promise<void> {
+        const messageBuilder = modify
+            .getCreator()
+            .startMessage()
+            .setRoom(room)
+            .setText(`🤖 FAQ Bot: ${answer}`);
 
-    /**
-     * Logs a message with the appropriate log level
-     */
-    private log(level: LogLevel, message: string): void {
-        if (this.appLogger) {
-            switch (level) {
-                case LogLevel.DEBUG:
-                    this.appLogger.debug(message);
-                    break;
-                case LogLevel.INFO:
-                    this.appLogger.info(message);
-                    break;
-                case LogLevel.WARN:
-                    this.appLogger.warn(message);
-                    break;
-                case LogLevel.ERROR:
-                    this.appLogger.error(message);
-                    break;
-            }
-        }
+        await modify.getCreator().finish(messageBuilder);
     }
-
-    /**
-     * Process a message in review mode
-     */
-    private async processInReviewMode(
-        matchResult: any, 
-        message: IMessage, 
-        read: IRead, 
-        persistence: IPersistence, 
-        modify: IModify
-    ): Promise<void> {
-        try {
-            this.log(LogLevel.DEBUG, 'Processing in review mode...');
-            
-            // Check if we have the necessary data
-            if (!matchResult || !matchResult.answer || !message.room) {
-                this.log(LogLevel.ERROR, 'Missing required data for review');
-                return;
-            }
-            
-            // Initialize services
-            const reviewManager = new ReviewManager(persistence, read.getPersistenceReader());
-            const notificationService = new NotificationService(read, modify);
-            
-            // Get the sender of the message
-            const sender = message.sender;
-            if (!sender) {
-                this.log(LogLevel.ERROR, 'Message sender not found');
-                return;
-            }
-            
-            // Create a new review
-            const review = await reviewManager.createReview(
-                message,
-                message.room,
-                sender,
-                matchResult.detectedQuestion || 'Unknown question',
-                matchResult.answer
-            );
-            
-            // Get reviewers
-            const reviewers = await this.getReviewers(read);
-            
-            if (reviewers.length === 0) {
-                this.log(LogLevel.WARN, 'No reviewers found, sending response directly');
-                await this.sendResponse(matchResult.answer, message.room.id, modify, read);
-                return;
-            }
-            
-            // Send notifications to reviewers
-            this.log(LogLevel.DEBUG, `Sending review notifications to ${reviewers.length} reviewers...`);
-            
-            for (const reviewer of reviewers) {
-                try {
-                    await notificationService.sendReviewNotification(review, reviewer);
-                } catch (error) {
-                    this.log(LogLevel.ERROR, `Error sending notification to reviewer ${reviewer.username}: ${error instanceof Error ? error.message : String(error)}`);
-                }
-            }
-            
-            this.log(LogLevel.INFO, `Review ${review.reviewId} created and notifications sent to ${reviewers.length} reviewers`);
-            
-            // Send a message to the channel that the answer is being reviewed
-            const messageBuilder = modify.getCreator().startMessage()
-                .setRoom(message.room)
-                .setText('🤖 FAQ Bot: Your question has been matched to an FAQ. A reviewer will approve the answer shortly.');
-            
-            await modify.getCreator().finish(messageBuilder);
-        } catch (error) {
-            this.log(LogLevel.ERROR, `Error processing in review mode: ${error instanceof Error ? error.message : String(error)}`);
-        }
-    }
-    
-    /**
-     * Get the list of available reviewers
-     */
-    private async getReviewers(read: IRead): Promise<IUser[]> {
-        try {
-            const reviewerUsernames = ['admin']; // Replace with actual configuration
-            const reviewers: IUser[] = [];
-            
-            for (const username of reviewerUsernames) {
-                const user = await read.getUserReader().getByUsername(username);
-                if (user) {
-                    reviewers.push(user);
-                }
-            }
-            
-            return reviewers;
-        } catch (error) {
-            this.log(LogLevel.ERROR, `Error getting reviewers: ${error instanceof Error ? error.message : String(error)}`);
-            return [];
-        }
-    }
-
-    /**
-     * Send a response to a channel
-     */
-    private async sendResponse(
-        answer: string,
-        roomId: string,
-        modify: IModify,
-        read: IRead
-    ): Promise<void> {
-        // No need to check for duplicate responses since duplicate detection is disabled
-        this.log(LogLevel.DEBUG, `Sending response to room ${roomId} (duplicate detection disabled)`);
-        
-        try {
-            // Get the room
-            const room = await read.getRoomReader().getById(roomId);
-            if (!room) {
-                this.log(LogLevel.ERROR, `Room not found: ${roomId}`);
-                return;
-            }
-            
-            // Make sure the answer is not empty
-            if (!answer || !answer.trim()) {
-                this.log(LogLevel.ERROR, 'Cannot send empty answer');
-                return;
-            }
-            
-            // Prefix the message to indicate it's from the bot
-            const text = `🤖 FAQ Bot: ${answer}`;
-            
-            const messageBuilder = modify.getCreator().startMessage()
-                .setRoom(room)
-                .setText(text);
-            
-            await modify.getCreator().finish(messageBuilder);
-            
-            // Record that this response was sent (still record it even though we're not checking)
-            const responseHash = this.createContentHash(answer);
-            this.processedContents.set(responseHash, Date.now());
-            
-            this.log(LogLevel.DEBUG, `Response sent to room: ${roomId}`);
-        } catch (error) {
-            this.log(LogLevel.ERROR, `Error sending response: ${error instanceof Error ? error.message : String(error)}`);
-            throw error;
-        }
-    }
-} 
+}

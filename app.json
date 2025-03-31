@@ -10,7 +10,7 @@
     },
     "name": "faq-detection",
     "nameSlug": "faq-detection",
-    "classFile": "FaqDetectionApp.ts",
+    "classFile": "src/apps/FaqDetectionApp.ts",
     "description": "Helps in newcommers faqs",
     "implements": [
         "IPostMessageSent",

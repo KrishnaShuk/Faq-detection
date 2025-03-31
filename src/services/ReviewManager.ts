@@ -203,10 +203,59 @@ export class ReviewManager {
     }
 
     /**
+     * Updates the proposed answer of a review
+     * @param reviewId - The ID of the review to update
+     * @param newAnswer - The new proposed answer
+     * @returns The updated review or undefined if not found
+     */
+    public async updateReviewAnswer(reviewId: string, newAnswer: string): Promise<Review | undefined> {
+        console.log(`[ReviewManager] Updating review answer: ${reviewId}`);
+        
+        const review = await this.getReviewById(reviewId);
+        
+        if (!review) {
+            console.log(`[ReviewManager] Review not found for answer update: ${reviewId}`);
+            return undefined;
+        }
+
+        console.log(`[ReviewManager] Found review for answer update: ${JSON.stringify(review)}`);
+
+        // Create association for the review ID
+        const reviewAssociation = new RocketChatAssociationRecord(
+            RocketChatAssociationModel.MISC,
+            `review:${reviewId}`
+        );
+
+        // Create association for the status (maintain the same status)
+        const statusAssociation = new RocketChatAssociationRecord(
+            RocketChatAssociationModel.MISC,
+            `status:${review.status}`
+        );
+
+        // Update the answer
+        const updatedReview: Review = {
+            ...review,
+            proposedAnswer: newAnswer
+        };
+
+        console.log(`[ReviewManager] Updated review with new answer: ${JSON.stringify(updatedReview)}`);
+
+        // We need to remove the old record and create a new one with updated associations
+        console.log(`[ReviewManager] Removing old review record with association: ${JSON.stringify(reviewAssociation)}`);
+        await this.persistence.removeByAssociations([reviewAssociation]);
+
+        // Store the updated review
+        console.log(`[ReviewManager] Storing updated review record with associations`);
+        await this.persistence.createWithAssociations(updatedReview, [reviewAssociation, statusAssociation]);
+
+        return updatedReview;
+    }
+
+    /**
      * Generates a unique review ID
      * @returns A unique review ID
      */
     private generateReviewId(): string {
         return `review_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     }
-} 
+}

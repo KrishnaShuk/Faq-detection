@@ -93,6 +93,11 @@ export enum ReviewStatus {
     REJECTED = 'rejected',
     
     /**
+     * Review is currently being edited
+     */
+    EDITING = 'editing',
+    
+    /**
      * Review has expired due to timeout
      */
     EXPIRED = 'expired'

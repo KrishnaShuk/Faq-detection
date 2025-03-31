@@ -10,6 +10,8 @@ export enum Settings {
     API_ENDPOINT = 'api_endpoint',
     REVIEWER_USERNAMES = 'reviewer_usernames',
     ENABLE_REVIEW_MODE = 'enable_review_mode',
+    SIMILARITY_THRESHOLD = 'similarity_threshold',
+    FAQ_LOG_CHANNEL = 'faq_log_channel'
 }
 
 export const settings: ISetting[] = [
@@ -62,6 +64,24 @@ export const settings: ISetting[] = [
         public: true,
         packageValue: true,
     },
+    {
+        id: Settings.SIMILARITY_THRESHOLD,
+        type: SettingType.NUMBER,
+        i18nLabel: "Similarity Threshold",
+        i18nDescription: "Threshold for direct FAQ matches (0.0-1.0). Higher values require closer matches for automatic responses.",
+        required: true,
+        public: true,
+        packageValue: 0.8,
+    },
+    {
+        id: Settings.FAQ_LOG_CHANNEL,
+        type: SettingType.STRING,
+        i18nLabel: "FAQ Log Channel",
+        i18nDescription: "Name of the channel where FAQ detection activity will be logged",
+        required: true,
+        public: true,
+        packageValue: 'faq-log',
+    },
 ];
 
 export async function getAPIConfig(read: IRead) {
@@ -69,11 +89,23 @@ export async function getAPIConfig(read: IRead) {
     const reviewerUsernamesStr = await envReader.getValueById(Settings.REVIEWER_USERNAMES);
     const reviewerUsernames = reviewerUsernamesStr ? reviewerUsernamesStr.split(',').map(username => username.trim()) : [];
     
+    // Get the similarity threshold and ensure it's a number
+    const thresholdValue = await envReader.getValueById(Settings.SIMILARITY_THRESHOLD);
+    const similarityThreshold = typeof thresholdValue === 'number' 
+        ? thresholdValue 
+        : typeof thresholdValue === 'string' 
+            ? parseFloat(thresholdValue) 
+            : 0.8;
+    
     return {
         apiKey: await envReader.getValueById(Settings.API_KEY),
         modelType: await envReader.getValueById(Settings.MODEL_TYPE),
         apiEndpoint: await envReader.getValueById(Settings.API_ENDPOINT),
         reviewerUsernames,
         enableReviewMode: await envReader.getValueById(Settings.ENABLE_REVIEW_MODE),
+        similarityThreshold,
+        faqLogChannel: await envReader.getValueById(Settings.FAQ_LOG_CHANNEL) || 'faq-log',
+        // Always enable round-robin for multiple reviewers
+        roundRobinReviewers: reviewerUsernames.length > 1,
     };
 }

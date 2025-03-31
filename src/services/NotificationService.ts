@@ -3,8 +3,8 @@ import { IRoom, RoomType } from '@rocket.chat/apps-engine/definition/rooms';
 import { IUser } from '@rocket.chat/apps-engine/definition/users';
 import { Review } from '../data/Review';
 import { BlockBuilder } from '@rocket.chat/apps-engine/definition/uikit/blocks';
-import { ButtonStyle } from '@rocket.chat/apps-engine/definition/uikit';
 import { TextObjectType } from '@rocket.chat/apps-engine/definition/uikit/blocks/Objects';
+import { ButtonStyle } from '@rocket.chat/apps-engine/definition/uikit';
 
 /**
  * Service for sending notifications to reviewers
@@ -56,10 +56,10 @@ export class NotificationService {
      * Sends a confirmation message to the reviewer after an action is taken
      * @param review - The review that was acted upon
      * @param reviewer - The reviewer who took the action
-     * @param action - The action that was taken (approve/reject)
+     * @param action - The action that was taken (approve/reject/edit/submit_edit/process_edit/cancel_edit)
      * @returns Promise that resolves when the confirmation is sent
      */
-    public async sendActionConfirmation(review: Review, reviewer: IUser, action: 'approve' | 'reject'): Promise<void> {
+    public async sendActionConfirmation(review: Review, reviewer: IUser, action: 'approve' | 'reject' | 'edit' | 'submit_edit' | 'process_edit' | 'cancel_edit'): Promise<void> {
         try {
             console.log(`[NotificationService] Sending action confirmation for review: ${review.reviewId}, action: ${action}`);
             
@@ -74,23 +74,97 @@ export class NotificationService {
             
             console.log(`[NotificationService] Got DM room: ${room.id}`);
             
-            // Create the confirmation message
-            let confirmationText = '';
+            // Create the confirmation blocks
+            const blocks = this.modify.getCreator().getBlockBuilder();
+            
+            // Add appropriate icon and title based on action
+            let icon = '';
+            let title = '';
+            let detailText = '';
+            
             if (action === 'approve') {
-                confirmationText = `✅ You approved the response to: "${review.originalMessage}"\n\nThe following response has been sent to the channel:\n\n${review.proposedAnswer}`;
-            } else {
-                confirmationText = `❌ You rejected the response to: "${review.originalMessage}"\n\nNo response has been sent to the channel.`;
+                icon = '✅';
+                title = 'Approved';
+                detailText = `Your approval has been processed. The response has been sent to @${review.senderUsername} in #${review.roomName}.`;
+            } else if (action === 'reject') {
+                icon = '❌';
+                title = 'Rejected';
+                detailText = `Your rejection has been processed. No response has been sent to @${review.senderUsername}.`;
+            } else if (action === 'edit') {
+                icon = '✏️';
+                title = 'Edit Mode';
+                detailText = `Please reply with your edited version of the response. When finished, click the Submit button below.`;
+                
+                // Add the original response for reference
+                blocks.addSectionBlock({
+                    text: {
+                        type: TextObjectType.MARKDOWN,
+                        text: `*Original Response:*\n${review.proposedAnswer}`
+                    }
+                });
+                
+                // Add submit and cancel buttons
+                blocks.addActionsBlock({
+                    elements: [
+                        blocks.newButtonElement({
+                            text: {
+                                type: TextObjectType.PLAINTEXT,
+                                text: 'Submit Edit'
+                            },
+                            style: ButtonStyle.PRIMARY,
+                            actionId: `submit_edit_${review.reviewId}`,
+                            value: review.reviewId
+                        }),
+                        blocks.newButtonElement({
+                            text: {
+                                type: TextObjectType.PLAINTEXT,
+                                text: 'Cancel'
+                            },
+                            style: ButtonStyle.DANGER,
+                            actionId: `cancel_edit_${review.reviewId}`,
+                            value: review.reviewId
+                        })
+                    ]
+                });
+            } else if (action === 'submit_edit') {
+                icon = '📝';
+                title = 'Edit Submitted';
+                detailText = `Your edit has been submitted. Please provide your edited response in the chat.`;
+            } else if (action === 'process_edit') {
+                icon = '✅';
+                title = 'Edit Processed';
+                detailText = `Your edited response has been processed and sent to @${review.senderUsername} in #${review.roomName}.`;
+            } else if (action === 'cancel_edit') {
+                icon = '🚫';
+                title = 'Edit Cancelled';
+                detailText = `Your edit has been cancelled. The original review is still pending.`;
             }
             
-            console.log(`[NotificationService] Created confirmation text: ${confirmationText.substring(0, 50)}...`);
+            // Add the title section
+            blocks.addSectionBlock({
+                text: {
+                    type: TextObjectType.MARKDOWN,
+                    text: `${icon} *${title}*`
+                }
+            });
+            
+            // Add the details section if not an edit action (for edit, we already added content above)
+            if (action !== 'edit') {
+                blocks.addSectionBlock({
+                    text: {
+                        type: TextObjectType.MARKDOWN,
+                        text: detailText
+                    }
+                });
+            }
             
             // Send the message
             console.log(`[NotificationService] Creating message builder`);
             const messageBuilder = this.modify.getCreator().startMessage()
                 .setRoom(room)
-                .setText(confirmationText);
+                .setBlocks(blocks);
             
-            console.log(`[NotificationService] Sending confirmation message`);    
+            console.log(`[NotificationService] Sending confirmation message`);
             await this.modify.getCreator().finish(messageBuilder);
             console.log(`[NotificationService] Confirmation message sent successfully`);
         } catch (error) {
@@ -108,9 +182,16 @@ export class NotificationService {
     public async getDMRoom(user: IUser): Promise<IRoom | undefined> {
         console.log(`[NotificationService] Getting or creating DM room for user: ${user.username}`);
         
+        const appUser = await this.read.getUserReader().getAppUser();
+        
+        if (!appUser) {
+            throw new Error('Could not get app user');
+        }
+        
         const roomBuilder = this.modify.getCreator().startRoom()
             .setType(RoomType.DIRECT_MESSAGE)
-            .setCreator(user);
+            .setCreator(appUser)
+            .setMembersToBeAddedByUsernames([user.username]);
         
         console.log(`[NotificationService] Created room builder`);
         const roomId = await this.modify.getCreator().finish(roomBuilder);
@@ -127,54 +208,32 @@ export class NotificationService {
      * @param review - The review to create blocks for
      * @returns The UI blocks
      */
-    private createReviewBlocks(review: Review): BlockBuilder {
+    public createReviewBlocks(review: Review): BlockBuilder {
         const blocks = this.modify.getCreator().getBlockBuilder();
         
-        // Add header section
+        // Add original message
         blocks.addSectionBlock({
             text: {
                 type: TextObjectType.MARKDOWN,
-                text: `*New FAQ Response Review*`
-            }
-        });
-        
-        // Add divider
-        blocks.addDividerBlock();
-        
-        // Add original message context
-        blocks.addSectionBlock({
-            text: {
-                type: TextObjectType.MARKDOWN,
-                text: `*Original Message:*\n${review.originalMessage}`
+                text: `*Original Message:*
+${review.originalMessage}`
             }
         });
         
         // Add room context
-        blocks.addContextBlock({
-            elements: [
-                {
-                    type: TextObjectType.MARKDOWN,
-                    text: `*Room:* ${review.roomName} | *From:* ${review.senderUsername}`
-                }
-            ]
-        });
-        
-        // Add divider
-        blocks.addDividerBlock();
-        
-        // Add detected question
         blocks.addSectionBlock({
             text: {
                 type: TextObjectType.MARKDOWN,
-                text: `*Detected FAQ:*\n${review.detectedQuestion}`
+                text: `*From:* @${review.senderUsername} | *Channel:* #${review.roomName}`
             }
         });
         
-        // Add proposed answer
+        // Add proposed response
         blocks.addSectionBlock({
             text: {
                 type: TextObjectType.MARKDOWN,
-                text: `*Proposed Response:*\n${review.proposedAnswer}`
+                text: `*Proposed Response by the LLM:*
+${review.proposedAnswer}`
             }
         });
         
@@ -216,4 +275,4 @@ export class NotificationService {
         
         return blocks;
     }
-} 
+}
