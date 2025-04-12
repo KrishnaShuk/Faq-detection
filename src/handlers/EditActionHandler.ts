@@ -1,6 +1,6 @@
 import { ILogger, IModify, IPersistence, IRead } from '@rocket.chat/apps-engine/definition/accessors';
 import { IUser } from '@rocket.chat/apps-engine/definition/users';
-import { ReviewStatus } from '../data/Review';
+import { Review, ReviewStatus } from '../data/Review';
 import { ReviewManager } from '../services/ReviewManager';
 import { NotificationService } from '../services/NotificationService';
 import { IRoom } from '@rocket.chat/apps-engine/definition/rooms';
@@ -8,6 +8,7 @@ import { ButtonStyle, TextObjectType } from '@rocket.chat/apps-engine/definition
 import { IUIKitSurface, UIKitSurfaceType } from '@rocket.chat/apps-engine/definition/uikit';
 import { ChannelService } from '../services/ChannelService';
 import { getAPIConfig } from '../config/settings';
+import { IMessage } from '@rocket.chat/apps-engine/definition/messages';
 
 /**
  * Handler for edit actions on FAQ reviews
@@ -34,48 +35,63 @@ export class EditActionHandler {
      * @param triggerId - The trigger ID for opening the modal
      * @returns Promise that resolves when the action is handled
      */
-    public async handleEditAction(reviewId: string, user: IUser, triggerId?: string): Promise<void> {
+    public async handleEditAction(reviewId: string, user: IUser, triggerId: string): Promise<void> {
         this.log('debug', `Starting edit action for review: ${reviewId}`);
         
         try {
             // Initialize services
             this.log('debug', `Initializing services`);
             const reviewManager = new ReviewManager(this.persistence, this.read.getPersistenceReader());
-            const notificationService = new NotificationService(this.read, this.modify);
             
             // Get the review
             this.log('debug', `Retrieving review: ${reviewId}`);
-            const review = await reviewManager.getReviewById(reviewId);
+            const reviewResult = await reviewManager.getReviewById(reviewId);
             
-            if (!review) {
+            if (!reviewResult) {
                 this.log('error', `Review not found: ${reviewId}`);
-                throw new Error(`Review not found: ${reviewId}`);
+                throw new Error('Review not found');
             }
             
-            this.log('debug', `Found review: ${JSON.stringify({
-                reviewId: review.reviewId,
-                roomId: review.roomId,
-                sender: review.senderUsername,
-                status: review.status
-            })}`);
+            const review: Review = reviewResult;
             
-            // Update review status to EDITING
-            this.log('debug', `Updating review status to EDITING`);
+            // Open the edit modal
+            this.log('debug', `Opening edit modal for review: ${reviewId}`);
+            await this.openEditModal(review, user, triggerId);
+            
+            // Update review status
+            this.log('debug', `Updating review status to editing`);
             await reviewManager.updateReviewStatus(reviewId, ReviewStatus.EDITING);
             
-            // Send confirmation to the reviewer
-            this.log('debug', `Sending confirmation to reviewer: ${user.username}`);
-            await notificationService.sendActionConfirmation(review, user, 'edit');
-            
-            // Open edit modal if triggerId is provided
-            if (triggerId) {
-                this.log('debug', `Opening edit modal with triggerId: ${triggerId}`);
-                await this.openEditModal(review, user, triggerId);
+            // Update log channel if enabled
+            const config = await getAPIConfig(this.read);
+            if (config.faqLogChannel) {
+                try {
+                    const channelService = new ChannelService(this.read, this.modify, this.logger);
+                    const appUser = await this.read.getUserReader().getAppUser();
+                    if (!appUser) {
+                        this.log('error', 'Could not get app user for logging');
+                        return;
+                    }
+                    
+                    const logChannel = await channelService.getOrCreateLogChannel(
+                        appUser,
+                        config.faqLogChannel
+                    );
+                    
+                    await channelService.updateLogMessageStatus(
+                        logChannel,
+                        reviewId,
+                        'editing',
+                        user
+                    );
+                } catch (error) {
+                    this.log('error', `Error updating log channel: ${error instanceof Error ? error.message : String(error)}`);
+                    this.log('error', `Stack trace: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
+                }
             }
-            
-            this.log('debug', `Edit action completed successfully for review: ${reviewId}`);
         } catch (error) {
             this.log('error', `Error handling edit action: ${error instanceof Error ? error.message : String(error)}`);
+            this.log('error', `Stack trace: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
             throw error;
         }
     }
@@ -87,7 +103,7 @@ export class EditActionHandler {
      * @param triggerId - The trigger ID for opening the modal
      * @returns Promise that resolves when the modal is opened
      */
-    private async openEditModal(review: any, user: IUser, triggerId: string): Promise<void> {
+    private async openEditModal(review: Review, user: IUser, triggerId: string): Promise<void> {
         this.log('debug', `Creating edit modal for review: ${review.reviewId}`);
         
         // Create the modal
@@ -103,7 +119,7 @@ export class EditActionHandler {
      * @param review - The review to edit
      * @returns The modal surface
      */
-    private createEditModal(review: any): IUIKitSurface {
+    private createEditModal(review: Review): IUIKitSurface {
         this.log('debug', `Building modal UI for review: ${review.reviewId}`);
         
         const blocks = this.modify.getCreator().getBlockBuilder();
@@ -133,7 +149,22 @@ export class EditActionHandler {
             }
         });
         
-        // Create the modal
+        // Store the review ID in a hidden state field
+        blocks.addInputBlock({
+            blockId: 'review_id_block',
+            optional: true,
+            element: blocks.newPlainTextInputElement({
+                actionId: 'review_id_input',
+                initialValue: review.reviewId,
+                multiline: false
+            }),
+            label: {
+                type: TextObjectType.PLAINTEXT,
+                text: 'Review ID (Do not edit)'
+            }
+        });
+        
+        // Create the modal with standard buttons
         const modal: IUIKitSurface = {
             id: `edit_modal_${review.reviewId}`,
             type: UIKitSurfaceType.MODAL,
@@ -144,59 +175,80 @@ export class EditActionHandler {
             blocks: blocks.getBlocks(),
             close: blocks.newButtonElement({
                 text: blocks.newPlainTextObject('Cancel'),
-                actionId: `cancel_edit_${review.reviewId}`
+                actionId: 'cancel'
             }),
             submit: blocks.newButtonElement({
                 text: blocks.newPlainTextObject('Submit'),
-                actionId: `submit_edit_${review.reviewId}`
+                actionId: 'submit'
             }),
             appId: 'faq-detection-app'
         };
         
+        this.log('debug', `Modal created with ID: ${modal.id}`);
         return modal;
     }
 
     /**
-     * Handles the submit edit action for a review
-     * @param reviewId - The ID of the review to submit edit for
-     * @param user - The user who submitted the edit
-     * @param editedAnswer - The edited answer text
-     * @returns Promise that resolves when the action is handled
+     * Handles the cancellation of an edit
+     * @param reviewId - ID of the review being edited
+     * @param user - User who cancelled the edit
      */
-    public async handleSubmitEdit(reviewId: string, user: IUser, editedAnswer?: string): Promise<void> {
-        this.log('debug', `Starting submit edit action for review: ${reviewId}`);
-        
+    public async handleCancelEdit(reviewId: string, user: IUser): Promise<void> {
         try {
-            // Initialize services
-            this.log('debug', `Initializing services`);
-            const reviewManager = new ReviewManager(this.persistence, this.read.getPersistenceReader());
-            const notificationService = new NotificationService(this.read, this.modify);
+            this.log('debug', `Handling cancel edit for review: ${reviewId} by user: ${user.id}`);
             
             // Get the review
-            this.log('debug', `Retrieving review: ${reviewId}`);
+            const reviewManager = new ReviewManager(this.persistence, this.read.getPersistenceReader());
             const review = await reviewManager.getReviewById(reviewId);
             
             if (!review) {
-                this.log('error', `Review not found: ${reviewId}`);
-                throw new Error(`Review not found: ${reviewId}`);
+                this.log('error', `Review not found for ID: ${reviewId}`);
+                return;
             }
             
-            // If we have an edited answer, update the review
-            if (editedAnswer) {
-                this.log('debug', `Updating review with edited answer`);
-                await reviewManager.updateReviewAnswer(reviewId, editedAnswer);
+            // Log the cancellation
+            this.log('info', `Edit cancelled for review: ${reviewId} by user: ${user.username}`);
+            
+            // Send confirmation to the user
+            const notificationService = new NotificationService(this.read, this.modify);
+            await notificationService.sendActionConfirmation(review, user, 'cancel_edit');
+            
+        } catch (error) {
+            this.log('error', `Error handling cancel edit: ${error instanceof Error ? error.message : String(error)}`);
+            this.log('error', `Stack trace: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
+        }
+    }
+
+    /**
+     * Handles the submission of an edited response
+     * @param reviewId - ID of the review being edited
+     * @param user - User who submitted the edit
+     * @param editedAnswer - The edited answer
+     */
+    public async handleSubmitEdit(reviewId: string, user: IUser, editedAnswer: string): Promise<void> {
+        try {
+            this.log('debug', `Handling submit edit for review: ${reviewId} by user: ${user.id}`);
+            
+            // Get the review
+            const reviewManager = new ReviewManager(this.persistence, this.read.getPersistenceReader());
+            const review = await reviewManager.getReviewById(reviewId);
+            
+            if (!review) {
+                this.log('error', `Review not found for ID: ${reviewId}`);
+                throw new Error(`Review not found for ID: ${reviewId}`);
             }
+            
+            // Update the review with the edited answer
+            await reviewManager.updateReviewAnswer(reviewId, editedAnswer);
             
             // Process the edited response
             await this.processEditedResponse(reviewId, user);
             
-            // Send confirmation to the reviewer
-            this.log('debug', `Sending edit submission confirmation to reviewer: ${user.username}`);
-            await notificationService.sendActionConfirmation(review, user, 'submit_edit');
+            this.log('info', `Edit submitted for review: ${reviewId} by user: ${user.username}`);
             
-            this.log('debug', `Submit edit action completed successfully for review: ${reviewId}`);
         } catch (error) {
-            this.log('error', `Error handling submit edit action: ${error instanceof Error ? error.message : String(error)}`);
+            this.log('error', `Error handling submit edit: ${error instanceof Error ? error.message : String(error)}`);
+            this.log('error', `Stack trace: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
             throw error;
         }
     }
@@ -219,30 +271,39 @@ export class EditActionHandler {
             const review = await reviewManager.getReviewById(reviewId);
             
             if (!review) {
-                this.log('error', `Review not found: ${reviewId}`);
-                throw new Error(`Review not found: ${reviewId}`);
+                this.log('error', `Review not found for ID: ${reviewId}`);
+                throw new Error(`Review not found for ID: ${reviewId}`);
             }
             
             // Get the source room
             const roomReader = this.read.getRoomReader();
-            const sourceRoom = await roomReader.getById(review.roomId);
+            const sourceRoomResult = await roomReader.getById(review.roomId);
             
-            if (!sourceRoom) {
+            if (!sourceRoomResult) {
                 this.log('error', `Source room not found: ${review.roomId}`);
                 throw new Error(`Source room not found: ${review.roomId}`);
             }
             
+            const sourceRoom: IRoom = sourceRoomResult;
+            
             // Get the sender
             const userReader = this.read.getUserReader();
-            const sender = await userReader.getById(review.senderId);
+            const senderResult = await userReader.getById(review.senderId);
             
-            if (!sender) {
+            if (!senderResult) {
                 this.log('error', `Sender not found: ${review.senderId}`);
                 throw new Error(`Sender not found: ${review.senderId}`);
             }
             
+            const sender: IUser = senderResult;
+            
+            // Get the original message to determine if it has a thread
+            const messageReader = this.read.getMessageReader();
+            const originalMessageResult = await messageReader.getById(review.messageId);
+            
             // Send the edited response to the source room
-            await this.sendResponseToRoom(sourceRoom, sender, review.proposedAnswer);
+            // Note: originalMessageResult might be undefined, but that's okay because we handle it in sendResponseToRoom
+            await this.sendResponseToRoom(sourceRoom, sender, review.proposedAnswer, originalMessageResult?.threadId);
             
             // Update review status to APPROVED
             await reviewManager.updateReviewStatus(reviewId, ReviewStatus.APPROVED);
@@ -271,6 +332,7 @@ export class EditActionHandler {
                     );
                 } catch (error) {
                     this.log('error', `Error updating log channel: ${error instanceof Error ? error.message : String(error)}`);
+                    this.log('error', `Stack trace: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
                 }
             }
             
@@ -280,41 +342,7 @@ export class EditActionHandler {
             this.log('debug', `Edited response processed successfully for review: ${reviewId}`);
         } catch (error) {
             this.log('error', `Error processing edited response: ${error instanceof Error ? error.message : String(error)}`);
-            throw error;
-        }
-    }
-
-    /**
-     * Handles the cancel edit action for a review
-     * @param reviewId - The ID of the review
-     * @param user - The user who cancelled the edit
-     * @returns Promise that resolves when the action is handled
-     */
-    public async handleCancelEdit(reviewId: string, user: IUser): Promise<void> {
-        this.log('debug', `Starting cancel edit action for review: ${reviewId}`);
-        
-        try {
-            // Initialize services
-            const reviewManager = new ReviewManager(this.persistence, this.read.getPersistenceReader());
-            const notificationService = new NotificationService(this.read, this.modify);
-            
-            // Get the review
-            const review = await reviewManager.getReviewById(reviewId);
-            
-            if (!review) {
-                this.log('error', `Review not found: ${reviewId}`);
-                throw new Error(`Review not found: ${reviewId}`);
-            }
-            
-            // Update review status back to PENDING
-            await reviewManager.updateReviewStatus(reviewId, ReviewStatus.PENDING);
-            
-            // Send confirmation to the reviewer
-            await notificationService.sendActionConfirmation(review, user, 'cancel_edit');
-            
-            this.log('debug', `Cancel edit action completed successfully for review: ${reviewId}`);
-        } catch (error) {
-            this.log('error', `Error handling cancel edit action: ${error instanceof Error ? error.message : String(error)}`);
+            this.log('error', `Stack trace: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
             throw error;
         }
     }
@@ -324,9 +352,10 @@ export class EditActionHandler {
      * @param room - The room to send the response to
      * @param sender - The original message sender
      * @param responseText - The response text to send
+     * @param threadId - The thread ID to use for the response
      * @returns Promise that resolves when the message is sent
      */
-    private async sendResponseToRoom(room: IRoom, sender: IUser, responseText: string): Promise<void> {
+    private async sendResponseToRoom(room: IRoom, sender: IUser, responseText: string, threadId?: string): Promise<void> {
         this.log('debug', `Sending response to room: ${room.id}`);
         
         const messageBuilder = this.modify.getCreator().startMessage()
@@ -334,8 +363,8 @@ export class EditActionHandler {
             .setText(responseText);
             
         // Set the sender as the thread parent if the original message has a thread
-        if (sender.id) {
-            messageBuilder.setThreadId(sender.id);
+        if (threadId) {
+            messageBuilder.setThreadId(threadId);
         }
         
         await this.modify.getCreator().finish(messageBuilder);

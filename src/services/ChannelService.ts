@@ -31,42 +31,63 @@ export class ChannelService {
     public async getOrCreateLogChannel(creator: IUser, channelName: string): Promise<IRoom> {
         this.logger.debug(`[ChannelService] Getting or creating log channel: ${channelName}`);
         
-        // Try to find the channel first
-        const roomReader = this.read.getRoomReader();
-        const existingRoom = await roomReader.getByName(channelName);
-        
-        if (existingRoom) {
-            this.logger.debug(`[ChannelService] Found existing channel: ${existingRoom.id}`);
-            return existingRoom;
+        try {
+            // Try to find the channel first by name
+            const roomReader = this.read.getRoomReader();
+            let existingRoom = await roomReader.getByName(channelName);
+            
+            // If not found by name, try by slugified name
+            if (!existingRoom) {
+                const slugifiedName = channelName.toLowerCase().replace(/\s+/g, '-');
+                this.logger.debug(`[ChannelService] Channel not found by name, trying slugified name: ${slugifiedName}`);
+                existingRoom = await roomReader.getByName(slugifiedName);
+            }
+            
+            if (existingRoom) {
+                this.logger.debug(`[ChannelService] Found existing channel: ${existingRoom.id}`);
+                return existingRoom;
+            }
+            
+            // Channel doesn't exist, create it
+            this.logger.debug(`[ChannelService] Channel not found, creating new channel`);
+            
+            const roomBuilder = this.modify.getCreator().startRoom();
+            roomBuilder.setType(RoomType.CHANNEL);
+            roomBuilder.setCreator(creator);
+            roomBuilder.setDisplayName(channelName);
+            
+            // Ensure the slugified name is valid
+            const slugifiedName = channelName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+            this.logger.debug(`[ChannelService] Using slugified name: ${slugifiedName}`);
+            roomBuilder.setSlugifiedName(slugifiedName);
+            
+            // Make the channel public
+            roomBuilder.setReadOnly(false);
+            roomBuilder.setDefault(false);
+            
+            // Create the channel
+            const roomId = await this.modify.getCreator().finish(roomBuilder);
+            this.logger.debug(`[ChannelService] Created new channel with ID: ${roomId}`);
+            
+            if (!roomId) {
+                throw new Error('Failed to create channel: No room ID returned');
+            }
+            
+            // Get the created room
+            const createdRoom = await roomReader.getById(roomId);
+            
+            if (!createdRoom) {
+                throw new Error(`Failed to retrieve created channel with ID: ${roomId}`);
+            }
+            
+            // Send an initial welcome message to the channel
+            await this.sendInitialMessage(createdRoom);
+            
+            return createdRoom;
+        } catch (error) {
+            this.logger.error(`[ChannelService] Error creating log channel: ${error instanceof Error ? error.message : String(error)}`);
+            throw new Error(`Failed to create log channel: ${error instanceof Error ? error.message : String(error)}`);
         }
-        
-        // Channel doesn't exist, create it
-        this.logger.debug(`[ChannelService] Channel not found, creating new channel`);
-        
-        const roomBuilder = this.modify.getCreator().startRoom();
-        roomBuilder.setType(RoomType.CHANNEL);
-        roomBuilder.setCreator(creator);
-        roomBuilder.setDisplayName(channelName);
-        roomBuilder.setSlugifiedName(channelName.toLowerCase().replace(/\s+/g, '-'));
-        
-        // Create the channel
-        const roomId = await this.modify.getCreator().finish(roomBuilder);
-        if (!roomId) {
-            throw new Error(`Failed to create FAQ log channel: ${channelName}`);
-        }
-        
-        // Get the created room
-        const createdRoom = await roomReader.getById(roomId);
-        if (!createdRoom) {
-            throw new Error(`Failed to retrieve created FAQ log channel: ${channelName}`);
-        }
-        
-        this.logger.debug(`[ChannelService] Created new channel: ${createdRoom.id}`);
-        
-        // Send initial message to the channel
-        await this.sendInitialMessage(createdRoom);
-        
-        return createdRoom;
     }
 
     /**
@@ -94,26 +115,67 @@ export class ChannelService {
         },
         reviewer?: IUser
     ): Promise<void> {
-        this.logger.debug(`[ChannelService] Logging ${messageType} message to channel: ${logChannel.id}`);
-        
-        // Create message blocks
-        const blocks = this.createLogMessageBlocks(
-            messageType,
-            originalMessage,
-            sender,
-            sourceRoom,
-            matchInfo,
-            reviewer
-        );
-        
-        // Send the message
-        const messageBuilder = this.modify.getCreator().startMessage()
-            .setRoom(logChannel)
-            .setBlocks(blocks);
+        try {
+            this.logger.debug(`[ChannelService] Logging ${messageType} message to channel: ${logChannel.id}`);
             
-        await this.modify.getCreator().finish(messageBuilder);
-        
-        this.logger.debug(`[ChannelService] Message logged successfully`);
+            if (!logChannel) {
+                throw new Error('Log channel is undefined or null');
+            }
+            
+            // Validate that the log channel exists and is accessible
+            const roomReader = this.read.getRoomReader();
+            const verifiedChannel = await roomReader.getById(logChannel.id);
+            
+            if (!verifiedChannel) {
+                throw new Error(`Could not verify log channel with ID: ${logChannel.id}`);
+            }
+            
+            // Create message blocks
+            const blocks = this.createLogMessageBlocks(
+                messageType,
+                originalMessage,
+                sender,
+                sourceRoom,
+                matchInfo,
+                reviewer
+            );
+            
+            if (!blocks) {
+                throw new Error('Failed to create message blocks');
+            }
+            
+            // Send the message
+            const messageBuilder = this.modify.getCreator().startMessage()
+                .setRoom(verifiedChannel);
+                
+            // Add blocks if available
+            if (blocks.getBlocks().length > 0) {
+                messageBuilder.setBlocks(blocks);
+            } else {
+                // Fallback to plain text if blocks are empty
+                const typeLabel = messageType === MessageType.ALPHA ? 'Direct FAQ Match' : 'LLM-Generated Response';
+                messageBuilder.setText(`[${typeLabel}] Message from ${sender.username} in ${sourceRoom.displayName || sourceRoom.slugifiedName || 'unknown room'}`);
+            }
+            
+            // Send the message and get the message ID
+            const messageId = await this.modify.getCreator().finish(messageBuilder);
+            
+            if (!messageId) {
+                throw new Error('Failed to send log message: No message ID returned');
+            }
+            
+            this.logger.debug(`[ChannelService] Message logged successfully with ID: ${messageId}`);
+            
+            // If this is a review message, store the message ID for later updates
+            if (messageType === MessageType.BETA && matchInfo.reviewId) {
+                this.logger.debug(`[ChannelService] Storing log message ID for review: ${matchInfo.reviewId}`);
+                // Implementation for storing message ID could be added here
+            }
+        } catch (error) {
+            this.logger.error(`[ChannelService] Error logging message: ${error instanceof Error ? error.message : String(error)}`);
+            this.logger.error(`[ChannelService] Stack trace: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
+            throw error; // Re-throw to allow caller to handle
+        }
     }
 
     /**

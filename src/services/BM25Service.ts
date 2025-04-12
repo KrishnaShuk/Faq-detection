@@ -75,28 +75,28 @@ export class BM25Service {
      * @returns The best matching FAQ and its similarity score
      */
     public search(query: string, faqs: FAQ[], similarityThreshold: number): { faq: FAQ | null, score: number, isDirectMatch: boolean } {
-        const tokens = this.tokenize(query);
-        const scores = this.calculateScores(tokens);
+        // First check for exact matches (case-insensitive)
+        const normalizedQuery = query.toLowerCase().trim();
         
-        // Find the highest scoring document
-        let maxScore = -1;
-        let maxIndex = -1;
-        
-        for (let i = 0; i < scores.length; i++) {
-            if (scores[i] > maxScore) {
-                maxScore = scores[i];
-                maxIndex = i;
+        for (let i = 0; i < faqs.length; i++) {
+            const normalizedFaqQuestion = faqs[i].question.toLowerCase().trim();
+            
+            // If we find an exact match, return it immediately with a perfect score
+            if (normalizedQuery === normalizedFaqQuestion) {
+                return {
+                    faq: faqs[i],
+                    score: 1.0, // Perfect match score
+                    isDirectMatch: true
+                };
             }
         }
         
-        // Determine if this is a direct match based on threshold
-        const isDirectMatch = maxScore >= similarityThreshold;
-        
-        // Return the best matching FAQ, or null if none found
+        // If no exact match is found, return no match
+        // We're skipping the BM25 calculation entirely to only allow exact matches
         return {
-            faq: maxIndex >= 0 ? faqs[maxIndex] : null,
-            score: maxScore,
-            isDirectMatch
+            faq: null,
+            score: 0,
+            isDirectMatch: false
         };
     }
     

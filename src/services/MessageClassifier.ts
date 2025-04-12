@@ -8,6 +8,7 @@ import { BM25Service } from './BM25Service';
 export enum MessageType {
     /**
      * Alpha message - Direct match to FAQ, can be answered without LLM
+     * Only messages with 99% confidence match are classified as Alpha
      */
     ALPHA = 'alpha',
     
@@ -53,18 +54,27 @@ export interface ClassificationResult {
 export class MessageClassifier {
     private bm25Service: BM25Service;
     
+    // Default threshold set to 0.99 (99%) for Alpha messages
+    private static readonly DEFAULT_SIMILARITY_THRESHOLD = 0.99;
+    
     /**
      * Creates a new MessageClassifier instance
      * @param faqs - The list of FAQs to use for classification
-     * @param similarityThreshold - Threshold for direct matches (Alpha messages)
+     * @param similarityThreshold - Threshold for direct matches (Alpha messages), defaults to 0.99 (99%)
      * @param logger - Logger instance
      */
     constructor(
         private readonly faqs: FAQ[],
-        private similarityThreshold: number,
+        private similarityThreshold: number = MessageClassifier.DEFAULT_SIMILARITY_THRESHOLD,
         private readonly logger: ILogger
     ) {
         this.bm25Service = new BM25Service(faqs);
+        
+        // Ensure threshold is at least 0.99 for strict Alpha classification
+        if (this.similarityThreshold < 0.99) {
+            this.logger.debug(`[MessageClassifier] Adjusting similarity threshold from ${this.similarityThreshold} to 0.99`);
+            this.similarityThreshold = 0.99;
+        }
     }
     
     /**
@@ -75,9 +85,9 @@ export class MessageClassifier {
     public classifyMessage(message: string): ClassificationResult {
         this.logger.debug(`[MessageClassifier] Classifying message: ${message}`);
         
-        // Skip very short messages or non-questions
-        if (message.length < 5 || !this.looksLikeQuestion(message)) {
-            this.logger.debug(`[MessageClassifier] Message too short or not a question`);
+        // Skip very short messages
+        if (message.length < 5) {
+            this.logger.debug(`[MessageClassifier] Message too short`);
             return {
                 type: MessageType.UNRELATED,
                 score: 0,
@@ -90,7 +100,7 @@ export class MessageClassifier {
         this.logger.debug(`[MessageClassifier] BM25 search result: ${JSON.stringify(searchResult)}`);
         
         if (searchResult.isDirectMatch && searchResult.faq) {
-            // Alpha message - direct match
+            // Alpha message - direct match with 99% confidence
             this.logger.debug(`[MessageClassifier] Alpha message detected with score: ${searchResult.score}`);
             return {
                 type: MessageType.ALPHA,
@@ -98,20 +108,13 @@ export class MessageClassifier {
                 score: searchResult.score,
                 message
             };
-        } else if (searchResult.score > 0) {
-            // Beta message - potential match but needs LLM
+        } else {
+            // Beta message - send to LLM for processing
+            // All messages that don't have an exact match are sent to LLM
             this.logger.debug(`[MessageClassifier] Beta message detected with score: ${searchResult.score}`);
             return {
                 type: MessageType.BETA,
-                score: searchResult.score,
-                message
-            };
-        } else {
-            // Unrelated message
-            this.logger.debug(`[MessageClassifier] Unrelated message detected`);
-            return {
-                type: MessageType.UNRELATED,
-                score: 0,
+                score: searchResult.score > 0 ? searchResult.score : 0.1, // Ensure a minimum score for tracking
                 message
             };
         }
@@ -131,30 +134,11 @@ export class MessageClassifier {
      * @param threshold - The new threshold value
      */
     public updateThreshold(threshold: number): void {
+        // Ensure threshold is at least 0.99 for strict Alpha classification
+        if (threshold < 0.99) {
+            this.logger.debug(`[MessageClassifier] Attempted to set threshold to ${threshold}, enforcing minimum of 0.99`);
+            threshold = 0.99;
+        }
         this.similarityThreshold = threshold;
-    }
-    
-    /**
-     * Heuristic to determine if a message looks like a question
-     * @param message - The message to check
-     * @returns True if the message looks like a question
-     */
-    private looksLikeQuestion(message: string): boolean {
-        // Check for question marks
-        if (message.includes('?')) {
-            return true;
-        }
-        
-        // Check for common question words at the start
-        const lowerMessage = message.toLowerCase().trim();
-        const questionStarters = ['how', 'what', 'when', 'where', 'why', 'who', 'which', 'can', 'could', 'would', 'is', 'are', 'do', 'does'];
-        
-        for (const starter of questionStarters) {
-            if (lowerMessage.startsWith(starter + ' ')) {
-                return true;
-            }
-        }
-        
-        return false;
     }
 }

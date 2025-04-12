@@ -71,7 +71,7 @@ export const settings: ISetting[] = [
         i18nDescription: "Threshold for direct FAQ matches (0.0-1.0). Higher values require closer matches for automatic responses.",
         required: true,
         public: true,
-        packageValue: 0.8,
+        packageValue: 0.99,
     },
     {
         id: Settings.FAQ_LOG_CHANNEL,
@@ -95,7 +95,7 @@ export async function getAPIConfig(read: IRead) {
         ? thresholdValue 
         : typeof thresholdValue === 'string' 
             ? parseFloat(thresholdValue) 
-            : 0.8;
+            : 0.99;
     
     return {
         apiKey: await envReader.getValueById(Settings.API_KEY),

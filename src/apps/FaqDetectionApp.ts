@@ -77,8 +77,20 @@ export class FaqDetectionApp extends App implements IPostMessageSent, IUIKitInte
         await Promise.all([
             ...settings.map((setting) =>
                 configuration.settings.provideSetting(setting)
-            ),
+            )
         ]);
+    }
+
+    /**
+     * Initialize the app
+     * This is called when the app is loaded
+     */
+    public async initialize(
+        configurationExtend: IConfigurationExtend
+    ): Promise<void> {
+        await this.extendConfiguration(configurationExtend);
+        
+        this.getLogger().debug('FAQ Detection App initialized');
     }
 
     /**
@@ -208,7 +220,7 @@ export class FaqDetectionApp extends App implements IPostMessageSent, IUIKitInte
             // Initialize services
             const messageClassifier = new MessageClassifier(
                 faqs,
-                config.similarityThreshold || 0.7,
+                config.similarityThreshold || 0.99,
                 this.getLogger()
             );
             
@@ -310,39 +322,19 @@ export class FaqDetectionApp extends App implements IPostMessageSent, IUIKitInte
         this.getLogger().debug('Alpha response sent successfully');
         
         // Log to FAQ channel if enabled
-        if (config.faqLogChannel) {
-            try {
-                // Get or create the log channel
-                const appUser = await read.getUserReader().getAppUser();
-                if (!appUser) {
-                    this.getLogger().error('Could not get app user for logging');
-                    return;
-                }
-                
-                const logChannel = await channelService.getOrCreateLogChannel(
-                    appUser,
-                    config.faqLogChannel
-                );
-                
-                // Log the message
-                await channelService.logMessage(
-                    logChannel,
-                    MessageType.ALPHA,
-                    classification.message,
-                    message.sender,
-                    message.room,
-                    {
-                        score: classification.score,
-                        matchedQuestion: classification.matchedFaq.question,
-                        proposedAnswer: answer
-                    }
-                );
-                
-                this.getLogger().debug('Alpha message logged to channel');
-            } catch (error) {
-                this.getLogger().error('Error logging Alpha message to channel:', error);
+        await this.logToFaqChannel(
+            message.text || '',  // Ensure we have a string, not undefined
+            message.room, 
+            message.sender, 
+            MessageType.ALPHA, 
+            read,
+            modify,
+            {
+                score: classification.score,
+                matchedQuestion: classification.matchedFaq.question,
+                proposedAnswer: answer
             }
-        }
+        );
     }
 
     /**
@@ -420,41 +412,13 @@ export class FaqDetectionApp extends App implements IPostMessageSent, IUIKitInte
                 this.getLogger().debug(`Review notification sent to ${reviewer.username}`);
                 
                 // Log to FAQ channel if enabled
-                if (config.faqLogChannel) {
-                    try {
-                        // Get or create the log channel
-                        const appUser = await read.getUserReader().getAppUser();
-                        if (!appUser) {
-                            this.getLogger().error('Could not get app user for logging');
-                            return;
-                        }
-                        
-                        const logChannel = await channelService.getOrCreateLogChannel(
-                            appUser,
-                            config.faqLogChannel
-                        );
-                        
-                        // Log the message
-                        await channelService.logMessage(
-                            logChannel,
-                            MessageType.BETA,
-                            classification.message,
-                            message.sender,
-                            message.room,
-                            {
-                                score: classification.score,
-                                matchedQuestion: llmResult.detectedQuestion,
-                                proposedAnswer: llmResult.answer,
-                                reviewId: review.reviewId
-                            },
-                            reviewer // Pass the reviewer to the logMessage method
-                        );
-                        
-                        this.getLogger().debug('Beta message logged to channel');
-                    } catch (error) {
-                        this.getLogger().error('Error logging Beta message to channel:', error);
-                    }
-                }
+                await this.logToFaqChannel(message.text || '', message.room, message.sender, MessageType.BETA, read, modify, {
+                    score: classification.score,
+                    matchedQuestion: llmResult.detectedQuestion,
+                    proposedAnswer: llmResult.answer,
+                    reviewId: review.reviewId
+                }, reviewer);
+                
             } else {
                 // Direct response mode (original behavior)
                 this.getLogger().debug('Review mode disabled, sending direct response...');
@@ -523,6 +487,9 @@ export class FaqDetectionApp extends App implements IPostMessageSent, IUIKitInte
 
     /**
      * Handles UI action button interactions (approve/reject)
+     * Note: This method is not being used for the current button implementation
+     * as the buttons are implemented as block actions, not action buttons.
+     * The executeBlockActionHandler method is used instead.
      */
     async executeActionButtonInteraction(
         context: UIKitActionButtonInteractionContext,
@@ -533,206 +500,98 @@ export class FaqDetectionApp extends App implements IPostMessageSent, IUIKitInte
     ): Promise<IUIKitResponse> {
         const { actionId, triggerId, user } = context.getInteractionData();
         this.getLogger().debug(`Action button clicked: ${actionId} by user: ${user.id}`);
+        this.getLogger().debug(`Note: This method is not being used for the current button implementation.`);
         
-        // Get the review ID from the action ID mapping
-        let reviewId: string | undefined;
-        
-        if (actionId.startsWith('approve_') || actionId.startsWith('reject_') || 
-            actionId.startsWith('edit_') || actionId.startsWith('submit_edit_') || 
-            actionId.startsWith('cancel_edit_') || actionId.startsWith('confirm_edit_')) {
-            // Extract reviewId from the actionId
-            const parts = actionId.split('_');
-            if (parts.length > 1) {
-                reviewId = parts[parts.length - 1];
-                // Also store it in the map for future reference
-                this.reviewActions.set(actionId, reviewId);
-            }
-        } else {
-            reviewId = this.reviewActions.get(actionId);
-        }
-        
-        if (!reviewId) {
-            this.getLogger().error(`No review ID found for action: ${actionId}`);
-            return context.getInteractionResponder().successResponse();
-        }
-        
-        // Get the review manager
-        const reviewManager = new ReviewManager(persistence, read.getPersistenceReader());
-        
-        // Get the review
-        const review = await reviewManager.getReviewById(reviewId);
-        if (!review) {
-            this.getLogger().error(`Review not found: ${reviewId}`);
-            return context.getInteractionResponder().successResponse();
-        }
-        
-        // Get the notification service
-        const notificationService = new NotificationService(read, modify);
-        
-        // Handle different actions
-        if (actionId.startsWith('approve_')) {
-            // Handle approve action
-            const handler = new ApproveActionHandler(read, persistence, modify, this.getLogger());
-            await handler.handleApproveAction(reviewId, user);
-            
-            // Update log channel if enabled
-            const config = await getAPIConfig(read);
-            if (config.faqLogChannel) {
-                try {
-                    const channelService = new ChannelService(read, modify, this.getLogger());
-                    const appUser = await read.getUserReader().getAppUser();
-                    if (!appUser) {
-                        this.getLogger().error('Could not get app user for logging');
-                        return context.getInteractionResponder().successResponse();
-                    }
-                    
-                    const logChannel = await channelService.getOrCreateLogChannel(
-                        appUser,
-                        config.faqLogChannel
-                    );
-                    
-                    await channelService.updateLogMessageStatus(
-                        logChannel,
-                        reviewId,
-                        'approved',
-                        user
-                    );
-                } catch (error) {
-                    this.getLogger().error('Error updating log channel:', error);
-                }
-            }
-        } else if (actionId.startsWith('reject_')) {
-            // Handle reject action
-            const handler = new RejectActionHandler(read, persistence, modify, this.getLogger());
-            await handler.handleRejectAction(reviewId, user);
-            
-            // Update log channel if enabled
-            const config = await getAPIConfig(read);
-            if (config.faqLogChannel) {
-                try {
-                    const channelService = new ChannelService(read, modify, this.getLogger());
-                    const appUser = await read.getUserReader().getAppUser();
-                    if (!appUser) {
-                        this.getLogger().error('Could not get app user for logging');
-                        return context.getInteractionResponder().successResponse();
-                    }
-                    
-                    const logChannel = await channelService.getOrCreateLogChannel(
-                        appUser,
-                        config.faqLogChannel
-                    );
-                    
-                    await channelService.updateLogMessageStatus(
-                        logChannel,
-                        reviewId,
-                        'rejected',
-                        user
-                    );
-                } catch (error) {
-                    this.getLogger().error('Error updating log channel:', error);
-                }
-            }
-        } else if (actionId.startsWith('edit_')) {
-            // Handle edit action
-            const handler = new EditActionHandler(read, persistence, modify, this.getLogger());
-            await handler.handleEditAction(reviewId, user, triggerId);
-            
-            // Update log channel if enabled
-            const config = await getAPIConfig(read);
-            if (config.faqLogChannel) {
-                try {
-                    const channelService = new ChannelService(read, modify, this.getLogger());
-                    const appUser = await read.getUserReader().getAppUser();
-                    if (!appUser) {
-                        this.getLogger().error('Could not get app user for logging');
-                        return context.getInteractionResponder().successResponse();
-                    }
-                    
-                    const logChannel = await channelService.getOrCreateLogChannel(
-                        appUser,
-                        config.faqLogChannel
-                    );
-                    
-                    await channelService.updateLogMessageStatus(
-                        logChannel,
-                        reviewId,
-                        'editing',
-                        user
-                    );
-                } catch (error) {
-                    this.getLogger().error('Error updating log channel:', error);
-                }
-            }
-        } else if (actionId.startsWith('submit_edit_')) {
-            // Handle submit edit action
-            const handler = new EditActionHandler(read, persistence, modify, this.getLogger());
-            await handler.handleSubmitEdit(reviewId, user);
-            
-            // Update log channel if enabled
-            const config = await getAPIConfig(read);
-            if (config.faqLogChannel) {
-                try {
-                    const channelService = new ChannelService(read, modify, this.getLogger());
-                    const appUser = await read.getUserReader().getAppUser();
-                    if (!appUser) {
-                        this.getLogger().error('Could not get app user for logging');
-                        return context.getInteractionResponder().successResponse();
-                    }
-                    
-                    const logChannel = await channelService.getOrCreateLogChannel(
-                        appUser,
-                        config.faqLogChannel
-                    );
-                    
-                    await channelService.updateLogMessageStatus(
-                        logChannel,
-                        reviewId,
-                        'edited',
-                        user
-                    );
-                } catch (error) {
-                    this.getLogger().error('Error updating log channel:', error);
-                }
-            }
-        } else if (actionId.startsWith('cancel_edit_')) {
-            // Handle cancel edit action
-            const handler = new EditActionHandler(read, persistence, modify, this.getLogger());
-            await handler.handleCancelEdit(reviewId, user);
-            
-            // Update log channel if enabled
-            const config = await getAPIConfig(read);
-            if (config.faqLogChannel) {
-                try {
-                    const channelService = new ChannelService(read, modify, this.getLogger());
-                    const appUser = await read.getUserReader().getAppUser();
-                    if (!appUser) {
-                        this.getLogger().error('Could not get app user for logging');
-                        return context.getInteractionResponder().successResponse();
-                    }
-                    
-                    const logChannel = await channelService.getOrCreateLogChannel(
-                        appUser,
-                        config.faqLogChannel
-                    );
-                    
-                    await channelService.updateLogMessageStatus(
-                        logChannel,
-                        reviewId,
-                        'pending',
-                        user
-                    );
-                } catch (error) {
-                    this.getLogger().error('Error updating log channel:', error);
-                }
-            }
-        }
-        
+        // Simply return success as we're handling buttons in executeBlockActionHandler
         return context.getInteractionResponder().successResponse();
     }
 
     /**
-     * Handles modal submit interactions
+     * Handles block action interactions (button clicks in UI blocks)
      */
+    async executeBlockActionHandler(
+        context: UIKitBlockInteractionContext,
+        read: IRead,
+        http: IHttp,
+        persistence: IPersistence,
+        modify: IModify
+    ): Promise<IUIKitResponse> {
+        const { actionId, user } = context.getInteractionData();
+        this.getLogger().debug(`Block action triggered: ${actionId} by user: ${user.id}`);
+        
+        try {
+            // Enhanced logging for debugging
+            this.getLogger().debug(`Action ID format: ${actionId}`);
+            
+            // Extract the action type from the actionId (first part before underscore)
+            const actionType = actionId.split('_')[0];
+            
+            // Extract the reviewId from the value property, which should contain just the reviewId
+            const { value } = context.getInteractionData();
+            this.getLogger().debug(`Action value: ${value}`);
+            
+            if (!value) {
+                throw new Error(`No review ID found in action value`);
+            }
+            
+            const reviewId = value;
+            this.getLogger().debug(`Using reviewId from value: ${reviewId}`);
+            
+            // Get the review manager
+            const reviewManager = new ReviewManager(persistence, read.getPersistenceReader());
+            
+            // Debug log to check if reviewManager is initialized
+            this.getLogger().debug(`Review manager initialized, looking for review: ${reviewId}`);
+            
+            // Get the review
+            const review = await reviewManager.getReviewById(reviewId);
+            
+            // Debug log for review retrieval
+            if (review) {
+                this.getLogger().debug(`Review found: ${JSON.stringify({
+                    id: review.reviewId,
+                    status: review.status,
+                    sender: review.senderUsername
+                })}`);
+            } else {
+                this.getLogger().debug(`No review found with ID: ${reviewId}`);
+                throw new Error(`Review not found: ${reviewId}`);
+            }
+            
+            switch (actionType) {
+                case 'approve':
+                    this.getLogger().debug(`Processing approve action for review: ${reviewId}`);
+                    const handler = new ApproveActionHandler(read, persistence, modify, this.getLogger());
+                    await handler.handleApproveAction(reviewId, user);
+                    break;
+                    
+                case 'reject':
+                    this.getLogger().debug(`Processing reject action for review: ${reviewId}`);
+                    const rejectHandler = new RejectActionHandler(read, persistence, modify, this.getLogger());
+                    await rejectHandler.handleRejectAction(reviewId, user);
+                    break;
+                    
+                case 'edit':
+                    this.getLogger().debug(`Processing edit action for review: ${reviewId}`);
+                    // For edit, we need to get the triggerId from the context
+                    const { triggerId } = context.getInteractionData();
+                    const editHandler = new EditActionHandler(read, persistence, modify, this.getLogger());
+                    await editHandler.handleEditAction(reviewId, user, triggerId);
+                    break;
+                    
+                default:
+                    this.getLogger().warn(`Unknown action type: ${actionType}`);
+                    break;
+            }
+            
+            return context.getInteractionResponder().successResponse();
+        } catch (error) {
+            this.getLogger().error(`Error handling block action: ${error.message}`);
+            this.getLogger().error(`Stack trace: ${error.stack}`);
+            return context.getInteractionResponder().errorResponse();
+        }
+    }
+
     async executeViewSubmitHandler(
         context: UIKitViewSubmitInteractionContext,
         read: IRead,
@@ -743,49 +602,80 @@ export class FaqDetectionApp extends App implements IPostMessageSent, IUIKitInte
         const { view, user } = context.getInteractionData();
         this.getLogger().debug(`Modal submitted: ${view.id} by user: ${user.id}`);
         
-        // Check if this is an edit modal
-        if (view.id.startsWith('edit_modal_')) {
-            // Extract review ID from the modal ID
-            const reviewId = view.id.replace('edit_modal_', '');
-            
-            // Get the edited answer from the input
-            // Use type assertion to access the state values
-            const state = view.state as any;
-            const editedAnswer = state && state.edit_answer_block ? 
-                state.edit_answer_block.edit_answer_input : undefined;
-            
-            if (!editedAnswer) {
-                this.getLogger().error(`No edited answer found in modal submission`);
-                return context.getInteractionResponder().successResponse();
-            }
-            
-            // Process the edited answer
-            try {
+        try {
+            // Check if this is an edit modal
+            if (view.id && view.id.startsWith('edit_modal_')) {
+                this.getLogger().debug(`Processing edit modal submission`);
+                
+                // Get the state from the view
+                const state = view.state as any;
+                this.getLogger().debug(`Modal state: ${JSON.stringify(state)}`);
+                
+                // Extract review ID and edited answer
+                let reviewId: string | undefined;
+                let editedAnswer: string | undefined;
+                
+                // Try to extract review ID from the modal ID first
+                if (view.id) {
+                    reviewId = view.id.replace('edit_modal_', '');
+                    this.getLogger().debug(`Extracted review ID from modal ID: ${reviewId}`);
+                }
+                
+                // Try to extract review ID from the hidden field
+                if (state && state.values && state.values.review_id_block && 
+                    state.values.review_id_block.review_id_input) {
+                    const reviewIdFromField = state.values.review_id_block.review_id_input;
+                    
+                    // Check if the value is a string or an object with a value property
+                    if (typeof reviewIdFromField === 'string') {
+                        reviewId = reviewIdFromField;
+                    } else if (reviewIdFromField && reviewIdFromField.value) {
+                        reviewId = reviewIdFromField.value;
+                    }
+                    
+                    this.getLogger().debug(`Extracted review ID from field: ${reviewId}`);
+                }
+                
+                // Extract edited answer
+                if (state && state.values && state.values.edit_answer_block && 
+                    state.values.edit_answer_block.edit_answer_input) {
+                    const answerField = state.values.edit_answer_block.edit_answer_input;
+                    
+                    // Check if the value is a string or an object with a value property
+                    if (typeof answerField === 'string') {
+                        editedAnswer = answerField;
+                    } else if (answerField && answerField.value) {
+                        editedAnswer = answerField.value;
+                    }
+                }
+                
+                if (!reviewId) {
+                    this.getLogger().error(`No review ID found in modal submission`);
+                    return context.getInteractionResponder().errorResponse();
+                }
+                
+                if (!editedAnswer) {
+                    this.getLogger().error(`No edited answer found in modal submission for review: ${reviewId}`);
+                    return context.getInteractionResponder().errorResponse();
+                }
+                
+                this.getLogger().debug(`Processing edit for review ${reviewId} with answer: ${editedAnswer.substring(0, 50)}...`);
+                
+                // Process the edited answer
                 const handler = new EditActionHandler(read, persistence, modify, this.getLogger());
                 await handler.handleSubmitEdit(reviewId, user, editedAnswer);
                 
-                return context.getInteractionResponder().successResponse();
-            } catch (error) {
-                this.getLogger().error(`Error processing edited answer: ${error}`);
-                return context.getInteractionResponder().errorResponse();
+                this.getLogger().debug(`Successfully processed edit submission for review: ${reviewId}`);
             }
+            
+            return context.getInteractionResponder().successResponse();
+        } catch (error) {
+            this.getLogger().error(`Error in view submit handler: ${error instanceof Error ? error.message : String(error)}`);
+            this.getLogger().error(`Stack trace: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
+            return context.getInteractionResponder().errorResponse();
         }
-        
-        return context.getInteractionResponder().successResponse();
     }
 
-    // Required by IUIKitInteractionHandler but not used in this app
-    async executeBlockActionHandler(
-        context: UIKitBlockInteractionContext,
-        read: IRead,
-        http: IHttp,
-        persistence: IPersistence,
-        modify: IModify
-    ): Promise<IUIKitResponse> {
-        return context.getInteractionResponder().successResponse();
-    }
-
-    // Required by IUIKitInteractionHandler but not used in this app
     async executeViewClosedHandler(
         context: UIKitViewCloseInteractionContext,
         read: IRead,
@@ -793,7 +683,111 @@ export class FaqDetectionApp extends App implements IPostMessageSent, IUIKitInte
         persistence: IPersistence,
         modify: IModify
     ): Promise<IUIKitResponse> {
-        return context.getInteractionResponder().successResponse();
+        try {
+            const { view, user, actionId } = context.getInteractionData();
+            this.getLogger().debug(`Modal closed: ${view.id} by user: ${user.id} with action: ${actionId}`);
+            
+            // Check if this is an edit modal being cancelled
+            if (view.id && view.id.startsWith('edit_modal_')) {
+                try {
+                    // Extract review ID from the modal ID
+                    const reviewId = view.id.replace('edit_modal_', '');
+                    this.getLogger().debug(`Edit modal cancelled for review: ${reviewId}`);
+                    
+                    // Handle the cancel action
+                    const handler = new EditActionHandler(read, persistence, modify, this.getLogger());
+                    await handler.handleCancelEdit(reviewId, user);
+                    
+                    this.getLogger().debug(`Successfully processed cancel edit for review: ${reviewId}`);
+                } catch (error) {
+                    this.getLogger().error(`Error handling modal close: ${error instanceof Error ? error.message : String(error)}`);
+                    this.getLogger().error(`Stack trace: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
+                }
+            }
+            
+            return context.getInteractionResponder().successResponse();
+        } catch (error) {
+            this.getLogger().error(`Error in view closed handler: ${error instanceof Error ? error.message : String(error)}`);
+            this.getLogger().error(`Stack trace: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
+            return context.getInteractionResponder().successResponse(); // Still return success to close the modal
+        }
+    }
+
+    /**
+     * Logs a message to the FAQ log channel
+     * This method should be called from handler methods that have access to the modify parameter
+     * @param message - The message to log
+     * @param room - The room where the original message was sent
+     * @param sender - The user who sent the original message
+     * @param type - The type of message (FAQ, BETA, etc.)
+     * @param read - The read accessor
+     * @param modify - The modify accessor
+     * @param additionalInfo - Additional information to include in the log
+     * @param reviewer - The reviewer assigned to the message (if any)
+     */
+    private async logToFaqChannel(
+        message: string,
+        room: IRoom,
+        sender: IUser,
+        type: MessageType,
+        read: IRead,
+        modify: IModify,
+        additionalInfo?: any,
+        reviewer?: IUser
+    ): Promise<void> {
+        try {
+            const config = await getAPIConfig(read);
+            
+            if (!config.faqLogChannel) {
+                this.getLogger().debug('FAQ log channel not configured, skipping logging');
+                return;
+            }
+            
+            // Get the app user for creating the channel if needed
+            const appUser = await read.getUserReader().getAppUser();
+            if (!appUser) {
+                this.getLogger().error('Could not get app user for logging');
+                return;
+            }
+            
+            this.getLogger().debug(`Attempting to log to channel: ${config.faqLogChannel}`);
+            
+            // Create channel service
+            const channelService = new ChannelService(
+                read,
+                modify,
+                this.getLogger()
+            );
+            
+            // Get or create the log channel
+            const logChannel = await channelService.getOrCreateLogChannel(
+                appUser,
+                config.faqLogChannel
+            );
+            
+            if (!logChannel) {
+                this.getLogger().error(`Failed to get or create log channel: ${config.faqLogChannel}`);
+                return;
+            }
+            
+            this.getLogger().debug(`Successfully got log channel: ${logChannel.id}, logging message`);
+            
+            // Log the message
+            await channelService.logMessage(
+                logChannel,
+                type,
+                message,
+                sender,
+                room,
+                additionalInfo,
+                reviewer
+            );
+            
+            this.getLogger().debug(`Successfully logged message to channel: ${logChannel.id}`);
+        } catch (error) {
+            this.getLogger().error(`Error logging to FAQ channel: ${error instanceof Error ? error.message : String(error)}`);
+            this.getLogger().error(`Stack trace: ${error instanceof Error ? error.stack : 'No stack trace available'}`);
+        }
     }
 
     // Simple string hashing function
